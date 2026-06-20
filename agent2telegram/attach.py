@@ -630,7 +630,10 @@ class AttachBridge:
                 # A new progress message → delete the current technical bubble so the next tool
                 # calls re-create it BELOW this message (the bubble always trails at the bottom).
                 self._status_clear()
+                _t0 = time.monotonic()
                 self.tg.send_message(self._owner_chat, out)
+                log.info("FWD +%.1fs (send %.1fs) %r",
+                         _t0 - self._turn_started, time.monotonic() - _t0, out[:30])
         elif ev.kind == "tool":
             if ev.key and ev.key not in self._seen_tools:
                 self._seen_tools.add(ev.key)

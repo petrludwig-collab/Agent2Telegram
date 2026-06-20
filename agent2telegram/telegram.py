@@ -99,9 +99,11 @@ class TelegramClient:
         self._opener = opener or urllib.request.build_opener()
 
     # ---- low-level ---------------------------------------------------------
-    def _call(self, method: str, params: dict | None = None, *, timeout: float = 65) -> dict:
+    def _call(self, method: str, params: dict | None = None, *, timeout: float = 65,
+              retries: int | None = None) -> dict:
         url = f"{API_ROOT}/bot{self._token}/{method}"
         data = urllib.parse.urlencode(params or {}, doseq=True).encode()
+        mx = self._max_retries if retries is None else retries
         attempt = 0
         while True:
             attempt += 1
@@ -118,12 +120,14 @@ class TelegramClient:
                     log.warning("Flood control on %s, waiting %ss", method, retry_after)
                     time.sleep(retry_after + 0.5)
                     continue                         # do not count flood waits as failures
-                if e.code >= 500 and attempt <= self._max_retries:
+                if e.code >= 500 and attempt <= mx:
+                    log.warning("%s: HTTP %s, retry %d/%d (backoff)", method, e.code, attempt, mx)
                     self._backoff(attempt)
                     continue
                 raise TelegramError(f"{method}: HTTP {e.code} {e.reason}") from e
             except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as e:
-                if attempt <= self._max_retries:
+                if attempt <= mx:
+                    log.warning("%s: %s, retry %d/%d (backoff)", method, e, attempt, mx)
                     self._backoff(attempt)
                     continue
                 raise TelegramError(f"{method}: {e}") from e
@@ -204,7 +208,8 @@ class TelegramClient:
 
     def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
         try:
-            self._call("sendChatAction", {"chat_id": chat_id, "action": action}, timeout=15)
+            # Cosmetic — fail fast (short timeout, no backoff) so a hiccup can't stall the turn.
+            self._call("sendChatAction", {"chat_id": chat_id, "action": action}, timeout=8, retries=0)
         except TelegramError:
             pass  # purely cosmetic; never let it break a turn
 
