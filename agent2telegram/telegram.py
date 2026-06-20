@@ -26,6 +26,10 @@ log = logging.getLogger("agent2telegram.telegram")
 API_ROOT = "https://api.telegram.org"
 #: Telegram rejects text messages longer than 4096 UTF-16 code units. We keep a margin.
 MAX_MESSAGE_LEN = 4000
+#: Timeout for outbound sends. A healthy send is ~0.1s; on a flaky host a connection can hang,
+#: so we cap it short and let the retry (a fresh connection) recover fast — far better than the
+#: 65s default, which made one stuck connection delay a reply by over a minute.
+SEND_TIMEOUT = 15
 
 
 def markdown_to_html(text: str) -> str:
@@ -187,7 +191,7 @@ class TelegramClient:
         if parse_mode:
             params["parse_mode"] = parse_mode
         try:
-            return self._call("sendMessage", params).get("message_id")
+            return self._call("sendMessage", params, timeout=SEND_TIMEOUT).get("message_id")
         except TelegramError:
             return None
 
@@ -196,13 +200,13 @@ class TelegramClient:
         if parse_mode:
             params["parse_mode"] = parse_mode
         try:
-            self._call("editMessageText", params)
+            self._call("editMessageText", params, timeout=SEND_TIMEOUT)
         except TelegramError:
             pass
 
     def delete_message(self, chat_id: int, message_id: int) -> None:
         try:
-            self._call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+            self._call("deleteMessage", {"chat_id": chat_id, "message_id": message_id}, timeout=SEND_TIMEOUT)
         except TelegramError:
             pass
 
@@ -221,15 +225,15 @@ class TelegramClient:
             base = {"chat_id": chat_id, "disable_web_page_preview": "true"}
             if parse_mode == "auto":
                 try:
-                    self._call("sendMessage", {**base, "text": markdown_to_html(chunk), "parse_mode": "HTML"})
+                    self._call("sendMessage", {**base, "text": markdown_to_html(chunk), "parse_mode": "HTML"}, timeout=SEND_TIMEOUT)
                 except TelegramError as e:
                     log.warning("HTML send failed, falling back to plain text: %s", e)
-                    self._call("sendMessage", {**base, "text": _strip_markdown(chunk)})
+                    self._call("sendMessage", {**base, "text": _strip_markdown(chunk)}, timeout=SEND_TIMEOUT)
             elif parse_mode:
                 try:
-                    self._call("sendMessage", {**base, "text": chunk, "parse_mode": parse_mode})
+                    self._call("sendMessage", {**base, "text": chunk, "parse_mode": parse_mode}, timeout=SEND_TIMEOUT)
                 except TelegramError as e:
                     log.warning("send failed with parse_mode=%s, retrying plain: %s", parse_mode, e)
-                    self._call("sendMessage", {**base, "text": chunk})
+                    self._call("sendMessage", {**base, "text": chunk}, timeout=SEND_TIMEOUT)
             else:
-                self._call("sendMessage", {**base, "text": chunk})
+                self._call("sendMessage", {**base, "text": chunk}, timeout=SEND_TIMEOUT)
