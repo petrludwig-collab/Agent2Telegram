@@ -26,7 +26,7 @@ class ConfigError(Exception):
 
 @dataclass
 class Config:
-    agent: str                          # adapter name: claude-code | codex | antigravity | generic
+    agent: str                          # adapter name: claude-code | codex | generic
     token: str                          # Telegram bot token
     allowed_user_ids: list[int] = field(default_factory=list)   # who may drive the agent
     workdir: str = ""                   # base dir for per-chat working directories
@@ -50,7 +50,7 @@ class Config:
 
     def validate(self) -> None:
         if not self.agent or not isinstance(self.agent, str):
-            raise ConfigError("Missing 'agent' (choose: claude-code, codex, antigravity).")
+            raise ConfigError("Missing 'agent' (choose: claude-code, codex, generic).")
         if not self.token or _TOKEN_HINT not in self.token:
             raise ConfigError("Missing or malformed Telegram bot token (expected '<id>:<secret>').")
         if not isinstance(self.allowed_user_ids, list) or not all(isinstance(i, int) for i in self.allowed_user_ids):

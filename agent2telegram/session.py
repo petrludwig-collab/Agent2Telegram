@@ -3,7 +3,7 @@ drives a live TUI, generalized into a product.
 
 Why tmux: it keeps the agent's *interactive* session alive, so full context, loaded tools
 and working state persist across messages — exactly like talking to it in a terminal. It
-works for any agent that has an interactive CLI (Claude Code, Codex, Antigravity…).
+works for any agent that has an interactive CLI (Claude Code, Codex, …).
 
 Inbound (proven send-keys sequence): clear the prompt line (``C-u``), type the message
 literally (``send-keys -l --``), then submit (``Enter``). Newlines are collapsed so a single

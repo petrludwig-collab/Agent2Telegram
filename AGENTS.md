@@ -1,6 +1,6 @@
 # AGENTS.md — install playbook for an AI agent
 
-> This file is written **for an AI coding agent** (Codex, Claude Code, Antigravity…)
+> This file is written **for an AI coding agent** (Codex, Claude Code…)
 > tasked with installing Agent2Telegram on a fresh machine for a non‑technical user.
 > Follow it as a recipe. Do **not** improvise around the security rules.
 
@@ -25,7 +25,6 @@ Run these and fix what's missing before installing:
 - The agent CLI to bridge must be installed **and logged in**:
   - Claude Code: `claude --version` and a prior `claude` login.
   - Codex: `codex --version` and a prior `codex` login.
-  - Antigravity: confirm the exact non‑interactive command (`antigravity --help`).
   - Test it works headlessly, e.g. `claude -p "say hi"` or `codex exec "say hi"`.
   If the agent CLI isn't installed/authenticated, **stop and ask the user to do that**
   (it requires an interactive login you can't complete for them).

@@ -4,12 +4,11 @@ from __future__ import annotations
 from .base import Adapter, AdapterError
 from .claude_code import ClaudeCodeAdapter
 from .codex import CodexAdapter
-from .antigravity import AntigravityAdapter
 from .generic import GenericAdapter
 
 #: Order matters: this is the order shown in the setup wizard.
 REGISTRY: dict[str, type[Adapter]] = {
-    a.name: a for a in (ClaudeCodeAdapter, CodexAdapter, AntigravityAdapter, GenericAdapter)
+    a.name: a for a in (ClaudeCodeAdapter, CodexAdapter, GenericAdapter)
 }
 
 

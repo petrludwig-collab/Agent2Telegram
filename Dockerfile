@@ -1,7 +1,7 @@
 # Agent2Telegram — container image.
 #
 # The bridge core has no Python dependencies, so this image is tiny. NOTE: the agent CLI
-# you connect (Claude Code / Codex / Antigravity) and its login are NOT baked in — mount
+# you connect (Claude Code / Codex) and its login are NOT baked in — mount
 # them or install in a derived image, because each requires interactive authentication
 # that must not live in a public image. See README "Docker" for the recommended setup.
 FROM python:3.12-slim
