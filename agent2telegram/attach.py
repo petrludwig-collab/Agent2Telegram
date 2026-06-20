@@ -102,6 +102,10 @@ class AttachBridge:
         self._last_activity = 0.0            # monotonic ts of last transcript activity (for typing)
         self._status = {"mid": None, "shown": ""}   # live one-line tool-call status bubble
         self._poke_pending = False                   # re-assert typing on next tick (after end-check)
+        self._last_typing = 0.0                      # monotonic ts of last "typing…" chat action
+        self._typing_count = 0                       # diagnostics: typing actions in current turn
+        self._turn_started = 0.0                     # diagnostics: monotonic ts of turn start
+        self._max_gap = 0.0                          # diagnostics: largest gap between typing actions
         # Persist the bubble's message_id so a restart/crash mid-turn can delete the orphan it
         # would otherwise leave behind in the chat.
         self._status_path = (self._signal.parent / "status_bubble") if self._signal else None
@@ -121,8 +125,9 @@ class AttachBridge:
             self._tpos = self._transcript.stat().st_size
             self._resume_position()
         self._cleanup_orphan_status()       # remove a bubble orphaned by a prior crash/restart
+        # Typing is driven entirely from the outbound loop (after the end-of-turn check) — no
+        # separate thread — so no "typing…" action can fire after the turn has ended.
         threading.Thread(target=self._outbound_loop, daemon=True).start()
-        threading.Thread(target=self._typing_loop, daemon=True).start()
         self._inbound_loop()
 
     def _resume_position(self) -> None:
@@ -221,9 +226,15 @@ class AttachBridge:
         # Light "typing…" from the very first moment — including the voice-transcription /
         # file-download window (seconds), so the indicator never has a gap at the start.
         self._consume_turn_end()                 # drop any stale end-marker from a prior turn
+        now = time.monotonic()
         self._turn_active.set()
-        self._last_activity = time.monotonic()
+        self._last_activity = now
+        self._turn_started = now
+        self._typing_count = 1
+        self._max_gap = 0.0
+        self._last_typing = now
         self.tg.send_chat_action(self._owner_chat, "typing")   # instant, don't wait for the loop
+        log.info("TURN START t=%.2f", time.time())
 
         text = (msg.get("text") or msg.get("caption") or "").strip()
         if msg.get("voice") or msg.get("audio"):
@@ -245,12 +256,23 @@ class AttachBridge:
             log.error("inject failed: %s", e)
             self._turn_active.clear()
 
-    def _poke_typing(self) -> None:
-        """Re-assert "typing…" immediately. Sending a message momentarily replaces the typing
-        indicator with the message; firing the action again right after closes that gap instead
-        of waiting up to TYPING_INTERVAL for the loop to come back around."""
-        if self._turn_active.is_set() and self._owner_chat is not None:
+    def _keep_typing(self) -> None:
+        """Assert "typing…" when due — called from the outbound loop AFTER the end-of-turn check,
+        so it never fires once the turn has ended. Fires immediately when a message/edit was just
+        sent (``_poke_pending``) to close the gap a send leaves, otherwise as a steady keepalive
+        every TYPING_INTERVAL (well under Telegram's ~5s display window → no visible gap)."""
+        if not (self._turn_active.is_set() and self._owner_chat is not None):
+            self._poke_pending = False
+            return
+        now = time.monotonic()
+        if self._poke_pending or now - self._last_typing >= TYPING_INTERVAL:
+            gap = now - self._last_typing
+            if gap > self._max_gap:
+                self._max_gap = gap
             self.tg.send_chat_action(self._owner_chat, "typing")
+            self._last_typing = now
+            self._typing_count += 1
+        self._poke_pending = False
 
     def _consume_turn_end(self) -> None:
         if self._turn_end is not None:
@@ -263,8 +285,14 @@ class AttachBridge:
         """Finish the current turn: drop the technical bubble and stop the typing indicator."""
         self._drain_transcript()          # catch anything written just before the Stop hook fired
         self._status_clear()
+        was_active = self._turn_active.is_set()
         self._turn_active.clear()
+        self._poke_pending = False        # ensure no queued poke fires after the turn ended
         self._consume_turn_end()
+        if was_active:
+            log.info("TURN END t=%.2f dur=%.1fs typing_fired=%d max_gap=%.2fs",
+                     time.time(), time.monotonic() - self._turn_started,
+                     self._typing_count, self._max_gap)
 
     # ---- outbound (session → Telegram) ------------------------------------
     def _outbound_loop(self) -> None:
@@ -282,12 +310,11 @@ class AttachBridge:
                 elif self._turn_active.is_set() and time.monotonic() - self._last_activity > IDLE_DONE:
                     self._status_clear()
                     self._turn_active.clear()
-                # Deferred typing re-assert: runs AFTER the end-of-turn check, so the final
-                # message (followed immediately by the turn-end marker) doesn't re-light typing,
-                # while mid-turn messages still do. _poke_typing is a no-op once the turn ended.
-                if self._poke_pending:
-                    self._poke_pending = False
-                    self._poke_typing()
+                # Typing runs AFTER the end-of-turn check: the final message is followed right
+                # away by the turn-end marker, so by here turn_active is already cleared and no
+                # "typing…" fires after it — typing stops with the last message. Mid-turn it
+                # re-asserts on every send and as a steady keepalive, so there's never a gap.
+                self._keep_typing()
             except Exception as e:
                 log.error("outbound error: %s", e)
             self._stop.wait(0.4)
@@ -310,6 +337,7 @@ class AttachBridge:
         else:
             self.tg.edit_plain(self._owner_chat, self._status["mid"], body, parse_mode="HTML")
             self._status["shown"] = line
+            self._poke_pending = True   # an edit can clear typing too → re-assert next tick
 
     def _status_clear(self) -> None:
         if self._status["mid"] is not None and self._owner_chat is not None:
@@ -426,13 +454,6 @@ class AttachBridge:
         # refresh activity so the typing indicator stays lit until the turn goes quiet.
         if self._turn_from_tg:
             self._last_activity = time.monotonic()
-
-    # ---- typing indicator --------------------------------------------------
-    def _typing_loop(self) -> None:
-        while not self._stop.is_set():
-            if self._turn_active.is_set() and self._owner_chat is not None:
-                self.tg.send_chat_action(self._owner_chat, "typing")
-            self._stop.wait(TYPING_INTERVAL)
 
     # ---- media helpers (reuse the same download/STT as one-shot mode) ------
     def _transcribe(self, media: dict, chat_id: int) -> str | None:
