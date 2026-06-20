@@ -99,10 +99,13 @@ class AttachBridge:
                 return p
         return Path.home() / ".codex" / "sessions"
 
-    def _newest_rollout(self) -> Path | None:
-        base = self._codex_sessions_dir()
-        files = glob.glob(str(base / "**" / "rollout-*.jsonl"), recursive=True) \
-            or glob.glob(str(base / "**" / "*.jsonl"), recursive=True)
+    @staticmethod
+    def _newest_under(base: Path, *patterns: str) -> Path | None:
+        files: list[str] = []
+        for pat in (patterns or ("*.jsonl",)):
+            files = glob.glob(str(base / "**" / pat), recursive=True)
+            if files:
+                break
         if not files:
             return None
         try:
@@ -110,15 +113,21 @@ class AttachBridge:
         except OSError:
             return None
 
+    def _newest_rollout(self) -> Path | None:
+        return self._newest_under(self._codex_sessions_dir(), "rollout-*.jsonl", "*.jsonl")
+
     def _resolve_transcript(self) -> Path | None:
-        if self.cfg.agent != "codex":
-            return Path(self.cfg.transcript_path) if self.cfg.transcript_path else None
+        """Resolve the transcript to tail. An explicit path is used as-is; ``""``/``"auto"``
+        auto-detects the newest transcript for the agent (Codex rollout / Claude Code session)."""
         tp = (self.cfg.transcript_path or "").strip()
         if tp and tp.lower() != "auto":
             p = Path(tp).expanduser()
-            if p.is_file():
-                return p           # explicit rollout file
-        return self._newest_rollout()
+            return self._newest_under(p) if p.is_dir() else p
+        if self.cfg.agent == "codex":
+            return self._newest_rollout()
+        if self.cfg.agent == "claude-code":
+            return self._newest_under(Path.home() / ".claude" / "projects")
+        return None
 
     def _maybe_reresolve_codex(self) -> None:
         """If Codex started a new session (newer rollout file), follow it from its start."""

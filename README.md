@@ -53,13 +53,21 @@ python3 -m agent2telegram run
 curl -fsSL https://raw.githubusercontent.com/petrludwig-collab/Agent2Telegram/main/install.sh | bash
 ```
 
-### What the wizard asks
-1. **Which agent** — Claude Code, Codex, Antigravity, or a generic CLI. It checks whether the
-   binary is on your `PATH`.
-2. **Telegram bot token** — create a bot with [@BotFather](https://t.me/BotFather) and paste
-   the token. The wizard verifies it live.
-3. **Authorize yourself** — send your bot any message; the wizard captures your user id and
-   adds it to the allow‑list.
+### What the wizard asks (3 steps)
+1. **Provider** — it auto-detects which agents are installed (Claude Code / Codex / Antigravity)
+   and you pick one. Codex and Claude Code get the full live experience; others are oneshot-only.
+2. **Session** — attach to an existing **tmux** session or create a fresh one (the wizard
+   launches the chosen agent in it for you).
+3. **Telegram** — paste the bot token from [@BotFather](https://t.me/BotFather); the wizard
+   verifies it live, then captures your user id from the first message you send the bot and wires
+   everything up. It can start the bridge for you on the spot.
+
+Codex needs no extra setup — its rollout log records turn boundaries. For Claude Code the wizard
+also registers the end-of-turn **Stop hook** automatically.
+
+You get the same live UX both ways: progress messages kept, a one-line italic status bubble for
+tool calls that trails at the bottom and clears at the end, and a `typing…` indicator that stays
+lit for the whole turn.
 
 ---
 
