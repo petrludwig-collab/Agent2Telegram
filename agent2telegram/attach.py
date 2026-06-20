@@ -101,6 +101,9 @@ class AttachBridge:
         self._turn_from_tg = False           # is the current transcript turn Telegram-originated?
         self._last_activity = 0.0            # monotonic ts of last transcript activity (for typing)
         self._status = {"mid": None, "shown": ""}   # live one-line tool-call status bubble
+        # Persist the bubble's message_id so a restart/crash mid-turn can delete the orphan it
+        # would otherwise leave behind in the chat.
+        self._status_path = (self._signal.parent / "status_bubble") if self._signal else None
         self._seen_tools: set = set()
 
     # ---- lifecycle ---------------------------------------------------------
@@ -116,6 +119,7 @@ class AttachBridge:
         if self._transcript and self._transcript.exists():
             self._tpos = self._transcript.stat().st_size
             self._resume_position()
+        self._cleanup_orphan_status()       # remove a bubble orphaned by a prior crash/restart
         threading.Thread(target=self._outbound_loop, daemon=True).start()
         threading.Thread(target=self._typing_loop, daemon=True).start()
         self._inbound_loop()
@@ -260,15 +264,16 @@ class AttachBridge:
             try:
                 self._drain_transcript()
                 self._drain_signal()
-                if self._turn_active.is_set():
-                    # Primary signal: the Stop hook wrote the end-of-turn marker → end now,
-                    # so "typing…" tracks the real turn boundary, not transcript silence.
-                    if self._turn_end is not None and self._turn_end.exists():
-                        self._end_turn()
-                    # Fallback: force-end if the transcript went quiet for too long (hook missing).
-                    elif time.monotonic() - self._last_activity > IDLE_DONE:
-                        self._status_clear()
-                        self._turn_active.clear()
+                # Primary signal: the Stop hook wrote the end-of-turn marker → end the turn,
+                # so "typing…" and the technical bubble track the real turn boundary. This is
+                # authoritative and runs even if turn_active wasn't set (e.g. a restart mid-turn,
+                # which is exactly when a stale bubble would otherwise be orphaned).
+                if self._turn_end is not None and self._turn_end.exists():
+                    self._end_turn()
+                # Fallback: force-end if the transcript went quiet for too long (hook missing).
+                elif self._turn_active.is_set() and time.monotonic() - self._last_activity > IDLE_DONE:
+                    self._status_clear()
+                    self._turn_active.clear()
             except Exception as e:
                 log.error("outbound error: %s", e)
             self._stop.wait(0.4)
@@ -285,6 +290,7 @@ class AttachBridge:
             if mid:
                 self._status["mid"] = mid
                 self._status["shown"] = line
+                self._persist_status(mid)
         else:
             self.tg.edit_plain(self._owner_chat, self._status["mid"], body, parse_mode="HTML")
             self._status["shown"] = line
@@ -294,6 +300,33 @@ class AttachBridge:
             self.tg.delete_message(self._owner_chat, self._status["mid"])
         self._status = {"mid": None, "shown": ""}
         self._seen_tools.clear()
+        self._persist_status(None)
+
+    def _persist_status(self, mid: int | None) -> None:
+        if self._status_path is None:
+            return
+        try:
+            if mid is None:
+                self._status_path.unlink()
+            else:
+                self._status_path.parent.mkdir(parents=True, exist_ok=True)
+                self._status_path.write_text(str(mid), "utf-8")
+        except OSError:
+            pass
+
+    def _cleanup_orphan_status(self) -> None:
+        """Delete a status bubble left over from a previous run that died mid-turn."""
+        if self._status_path is None or self._owner_chat is None:
+            return
+        try:
+            mid = int(self._status_path.read_text("utf-8").strip())
+        except (OSError, ValueError):
+            return
+        self.tg.delete_message(self._owner_chat, mid)
+        try:
+            self._status_path.unlink()
+        except OSError:
+            pass
 
     def _drain_signal(self) -> None:
         if not self._signal or not self._signal.exists():
