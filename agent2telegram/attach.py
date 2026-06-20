@@ -664,10 +664,15 @@ class AttachBridge:
             self._last_activity = time.monotonic()
 
     def _strip_marker(self, text: str) -> str:
-        """Remove a leading progress marker (e.g. ``[TG]``) from the first line, if present."""
+        """Remove the progress marker (e.g. ``[TG]``) from the start of *any* line. It's a routing
+        token, never content — so a stray one mid-message (narration before the marked reply) must
+        not leak into the chat. Case-insensitive so ``[tg]`` and ``[TG]`` are both caught."""
+        marker = self._marker.lower()
         lines = text.splitlines()
-        if lines and lines[0].lstrip().startswith(self._marker):
-            lines[0] = lines[0].lstrip()[len(self._marker):].lstrip()
+        for i, ln in enumerate(lines):
+            s = ln.lstrip()
+            if s.lower().startswith(marker):
+                lines[i] = s[len(self._marker):].lstrip()
         return "\n".join(lines).strip()
 
     def _handle_event(self, ev) -> None:
