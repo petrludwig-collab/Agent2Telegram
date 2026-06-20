@@ -13,7 +13,7 @@ import sys
 import time
 
 from . import adapters
-from .config import Config, save
+from .config import Config, save, config_path
 from .telegram import TelegramClient, TelegramError
 
 
@@ -76,6 +76,11 @@ def _capture_owner_id(token: str) -> int | None:
 
 def run() -> int:
     print("=== Agent2Telegram setup ===")
+    existing = config_path()
+    if existing.exists():
+        if _ask(f"A config already exists at {existing}. Overwrite? (y/N)").lower() not in ("y", "yes"):
+            print("Aborted — keeping the existing config.")
+            return 0
     agent_cls = _choose_agent()
 
     command = None

@@ -1,5 +1,10 @@
 # Agent2Telegram
 
+[![CI](https://github.com/petrludwig-collab/Agent2Telegram/actions/workflows/ci.yml/badge.svg)](https://github.com/petrludwig-collab/Agent2Telegram/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 Talk to your coding agent — **Claude Code**, **Codex**, or **Antigravity** — from **Telegram**.
 
 Agent2Telegram is a tiny, dependency‑free bridge. It long‑polls Telegram for messages from

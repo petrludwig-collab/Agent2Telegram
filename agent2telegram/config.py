@@ -90,6 +90,11 @@ def save(cfg: Config, path: Path | None = None) -> Path:
     cfg.validate()
     p = path or config_path()
     p.parent.mkdir(parents=True, exist_ok=True)
+    # Lock down the directory too (best effort) — it holds a secret-bearing file.
+    try:
+        os.chmod(p.parent, stat.S_IRWXU)   # 0700
+    except OSError:
+        pass
     # Write atomically, then lock down permissions — the file contains a secret.
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.write_text(json.dumps(asdict(cfg), indent=2, ensure_ascii=False), "utf-8")

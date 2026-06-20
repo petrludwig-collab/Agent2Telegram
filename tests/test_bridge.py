@@ -65,6 +65,13 @@ class BridgeContinuityTests(unittest.TestCase):
         self.assertFalse(self.adapter.calls[0]["is_continuation"])
         self.assertFalse(self.adapter.calls[1]["is_continuation"])  # different chat → fresh
 
+    def test_non_text_message_gets_friendly_notice(self):
+        # Authorized user sends a photo (no 'text') → friendly notice, no agent call.
+        self.bridge._dispatch({"update_id": 1, "message": {
+            "chat": {"id": 100}, "from": {"id": 7}, "photo": [{"file_id": "x"}]}})
+        self.assertEqual(self.adapter.calls, [])
+        self.assertTrue(any("text" in t.lower() for _, t in self.bridge.tg.sent))
+
     def test_unauthorized_user_is_refused(self):
         self.bridge._dispatch({"update_id": 1, "message": {
             "chat": {"id": 100}, "from": {"id": 999}, "text": "do something"}})

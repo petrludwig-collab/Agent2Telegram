@@ -52,7 +52,7 @@ class Bridge:
 
     # ---- lifecycle ---------------------------------------------------------
     def run(self) -> None:
-        me = self.tg.get_me()
+        me = self._connect()
         log.info("Connected as @%s — agent=%s, authorized users=%s",
                  me.get("username"), self.cfg.agent, sorted(self._allowed) or "(none!)")
         if not self._allowed:
@@ -76,6 +76,19 @@ class Bridge:
             self._save_offset(offset)
         self._shutdown()
 
+    def _connect(self) -> dict:
+        """Verify the token at startup, retrying so a not-yet-ready network at boot
+        doesn't crash the service (it just waits for connectivity)."""
+        delay = 2
+        while not self._stop.is_set():
+            try:
+                return self.tg.get_me()
+            except Exception as e:
+                log.warning("Telegram not reachable yet (%s); retrying in %ss", e, delay)
+                self._stop.wait(delay)
+                delay = min(delay * 2, 60)
+        return {}
+
     def _install_signal_handlers(self) -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -94,16 +107,15 @@ class Bridge:
     # ---- dispatch ----------------------------------------------------------
     def _dispatch(self, update: dict) -> None:
         msg = update.get("message")
-        if not msg or "text" not in msg:
+        if not msg:
             return
         chat_id = msg["chat"]["id"]
         user = msg.get("from", {})
         user_id = user.get("id")
-        text = msg["text"].strip()
+        text = (msg.get("text") or "").strip()
 
-        if text.startswith("/"):
-            if self._handle_command(chat_id, user_id, text):
-                return
+        if text.startswith("/") and self._handle_command(chat_id, user_id, text):
+            return
 
         if user_id not in self._allowed:
             log.warning("Refused message from unauthorized user %s (%s)", user_id, user.get("username"))
@@ -113,6 +125,10 @@ class Bridge:
                 f"Your user id is `{user_id}` — ask the owner to add it.",
                 parse_mode="Markdown",
             )
+            return
+
+        if not text:
+            self.tg.send_message(chat_id, "ℹ️ I can only handle text messages right now.")
             return
 
         self._enqueue(chat_id, text)

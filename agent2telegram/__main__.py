@@ -63,7 +63,9 @@ def _cmd_doctor(_args) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agent2telegram", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    from . import __version__
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    parser.add_argument("-V", "--version", action="version", version=f"agent2telegram {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("setup", help="interactive setup wizard")
     sub.add_parser("run", help="start the bridge")
