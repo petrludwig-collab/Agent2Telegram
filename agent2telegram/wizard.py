@@ -259,15 +259,17 @@ def run() -> int:
 
     if not cfg.allowed_user_ids:
         print("⚠️  No authorized user — add your id to 'allowed_user_ids' before using the bot.")
-    print("\nAll set! Start the bridge with:\n  python3 -m agent2telegram run")
-    if _yes("\nStart it now in the background?"):
-        log = state / "run.log"
-        state.mkdir(parents=True, exist_ok=True)
-        subprocess.Popen([sys.executable, "-m", "agent2telegram", "run"],
-                         stdout=open(log, "a"), stderr=subprocess.STDOUT,
-                         stdin=subprocess.DEVNULL, start_new_session=True)
-        print(f"  ✓ started — logs at {log}")
-        print(f"  Message @{me.get('username')} on Telegram to test it.")
+    # Just start it — no prompt. Asking "start now? (y/N)" only confuses people (esp. anyone
+    # used to a Windows installer that simply finishes). The bridge belongs running.
+    print("\nAll set! Starting the bridge in the background…")
+    log = state / "run.log"
+    state.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen([sys.executable, "-m", "agent2telegram", "run"],
+                     stdout=open(log, "a"), stderr=subprocess.STDOUT,
+                     stdin=subprocess.DEVNULL, start_new_session=True)
+    print(f"  ✓ running — logs at {log}")
+    print(f"  Message @{me.get('username')} on Telegram to test it.")
+    print("  (Stop it anytime with:  python3 -m agent2telegram uninstall)")
     return 0
 
 
