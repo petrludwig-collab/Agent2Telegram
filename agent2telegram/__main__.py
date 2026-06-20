@@ -23,13 +23,17 @@ def _setup_logging(verbose: bool) -> None:
 
 def _cmd_run(_args) -> int:
     from .config import load, ConfigError
-    from .bridge import Bridge
     try:
         cfg = load()
     except ConfigError as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2
-    Bridge(cfg).run()
+    if cfg.mode == "attach":
+        from .attach import AttachBridge
+        AttachBridge(cfg).run()
+    else:
+        from .bridge import Bridge
+        Bridge(cfg).run()
     return 0
 
 

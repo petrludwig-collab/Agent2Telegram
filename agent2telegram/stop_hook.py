@@ -89,6 +89,12 @@ def main() -> None:
         return
     if not from_origin or not turn:
         return                                           # terminal-originated / nothing to send
+    # If the turn used the progress marker, the live watcher already sent everything.
+    marker = cfg.get("progress_marker", "[tg]")
+    if marker and any(
+        any(ln.lstrip().startswith(marker) for ln in t.splitlines()) for t in turn
+    ):
+        return
     try:
         Path(signal).parent.mkdir(parents=True, exist_ok=True)
         Path(signal).write_text(turn[-1], encoding="utf-8")

@@ -35,6 +35,14 @@ class Config:
     agent_timeout: int = 600            # seconds before a single agent run is killed
     poll_timeout: int = 50              # long-poll timeout for getUpdates
     elevenlabs_api_key: str = ""        # optional: enables voice-message transcription (STT)
+    # ---- persistent "attach" mode (drive an existing live agent session) ----
+    mode: str = "oneshot"               # "oneshot" | "attach"
+    tmux_session: str = ""              # name of the existing tmux session to drive
+    signal_file: str = ""               # where the Stop hook writes the final answer
+    transcript_path: str = ""           # agent transcript to tail for interim updates
+    origin_prefix: str = "Telegram:"    # injected before each message; hook forwards only these
+    claude_session_id: str = ""         # guard: only act on this session's transcript
+    progress_marker: str = "[tg]"       # lines starting with this are sent live (interim)
 
     def path_workdir(self) -> Path:
         base = Path(self.workdir).expanduser() if self.workdir else (_state_dir() / "chats")

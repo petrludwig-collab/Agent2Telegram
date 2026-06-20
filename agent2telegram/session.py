@@ -77,6 +77,9 @@ class TmuxSession:
         self._signal = signal_file
         cwd.mkdir(parents=True, exist_ok=True)
         if not self._exists():
+            if not agent_argv:
+                # Attach mode: we only drive an existing session, never create one.
+                raise SessionError(f"tmux session '{self.name}' does not exist (attach mode).")
             _tmux("new-session", "-d", "-s", self.name, "-x", "220", "-y", "50", *agent_argv,
                   timeout=15)
             time.sleep(boot_wait)   # let the TUI come up before the first message
@@ -104,6 +107,13 @@ class TmuxSession:
 
     def _capture(self) -> str:
         return _tmux("capture-pane", "-p", "-t", self.name, check=False).stdout
+
+    def inject(self, text: str) -> None:
+        """Fire-and-forget: type the message into the session, don't wait for a reply.
+        Used by the async attach bridge (outbound is handled separately)."""
+        if not self.alive:
+            raise SessionError(f"agent session '{self.name}' is gone")
+        self._send_keys(text)
 
     def send(self, text: str) -> str:
         if not self.alive:
