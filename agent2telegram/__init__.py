@@ -1,4 +1,4 @@
-"""Agent2Telegram — connect a coding agent (Claude Code, Codex, Antigravity) to Telegram.
+"""Agent2Telegram — connect a coding agent (Claude Code or Codex) to Telegram.
 
 A small, dependency-free bridge: it long-polls Telegram for messages from authorized
 users, hands each message to the configured agent CLI, and streams the reply back.

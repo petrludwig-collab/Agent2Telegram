@@ -5,14 +5,14 @@
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-Talk to your coding agent — **Claude Code**, **Codex**, or **Antigravity** — from **Telegram**.
+Talk to your coding agent — **Claude Code** or **Codex** — from **Telegram**.
 
 Agent2Telegram is a tiny, dependency‑free bridge. It long‑polls Telegram for messages from
 **you** (and only you), hands each one to the agent CLI of your choice, and sends the reply
 back. No public IP, no webhook, no cloud — it runs on your own machine, behind your router.
 
 ```
-Telegram  ⇄  Agent2Telegram  ⇄  claude / codex / antigravity
+Telegram  ⇄  Agent2Telegram  ⇄  claude / codex
 ```
 
 **What you can send:** plain text, **images** and **files** (downloaded and handed to the
@@ -54,8 +54,7 @@ curl -fsSL https://raw.githubusercontent.com/petrludwig-collab/Agent2Telegram/ma
 ```
 
 ### What the wizard asks (3 steps)
-1. **Provider** — it auto-detects which agents are installed (Claude Code / Codex / Antigravity)
-   and you pick one. Codex and Claude Code get the full live experience; others are oneshot-only.
+1. **Provider** — it auto-detects which agents are installed (Claude Code / Codex) and you pick one.
 2. **Session** — attach to an existing **tmux** session or create a fresh one (the wizard
    launches the chosen agent in it for you).
 3. **Telegram** — paste the bot token from [@BotFather](https://t.me/BotFather); the wizard
@@ -102,7 +101,6 @@ the agent has an easy, checkable job — and can repair the rare clean‑server 
 - The agent you want to connect, **installed and logged in**:
   - Claude Code — <https://docs.claude.com/claude-code> (run `claude` once to sign in)
   - Codex — <https://github.com/openai/codex> (run `codex` once to sign in)
-  - Antigravity — Google’s agent CLI (set the exact command in config; see below)
 
 The bridge shells out to these tools, so whatever they can do in your terminal, they can do
 from Telegram.

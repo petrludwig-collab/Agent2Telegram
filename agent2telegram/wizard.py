@@ -1,7 +1,6 @@
 """Interactive 3-step setup wizard for attach mode.
 
-  1. **Provider** — auto-detect which agents are installed (Claude Code / Codex / Antigravity)
-     and pick one.
+  1. **Provider** — auto-detect which agents are installed (Claude Code / Codex) and pick one.
   2. **Session** — attach to an existing tmux session or create a fresh one (launching the agent
      in it for you).
   3. **Telegram** — paste the bot token; we validate it live and capture your user id from the
@@ -24,7 +23,8 @@ from . import adapters
 from .config import Config, save, config_path
 from .telegram import TelegramClient, TelegramError
 
-#: Agents we can drive in attach mode (have a transcript reader). Others are oneshot-only.
+#: Agents fully supported in attach mode (live progress, status bubble, typing). The Telegram
+#: bridge officially supports these two; other CLIs would need their own transcript reader.
 ATTACH_SUPPORTED = {"claude-code", "codex"}
 
 
@@ -47,17 +47,15 @@ def _yes(prompt: str, default_yes: bool = False) -> bool:
 
 # ---------------------------------------------------------------- step 1: provider
 def _choose_provider() -> type:
-    agents = [a for a in adapters.available() if a.name != "generic"]
+    agents = [a for a in adapters.available() if a.name in ATTACH_SUPPORTED]
     print("\n── Step 1/3 · Which agent do you want to connect? ──\n")
     for i, a in enumerate(agents, 1):
         found = a.detect()
         mark = "✓ installed" if found else "· not found on PATH"
-        attach = "" if a.name in ATTACH_SUPPORTED else "  (oneshot only — no live updates yet)"
-        print(f"  {i}) {a.label:<14} {mark}{attach}")
+        print(f"  {i}) {a.label:<14} {mark}")
     print()
-    # Default to the first *installed* attach-capable agent.
-    default = next((str(i) for i, a in enumerate(agents, 1)
-                    if a.detect() and a.name in ATTACH_SUPPORTED), "1")
+    # Default to the first *installed* agent.
+    default = next((str(i) for i, a in enumerate(agents, 1) if a.detect()), "1")
     while True:
         choice = _ask("Pick a number", default)
         if choice.isdigit() and 1 <= int(choice) <= len(agents):
@@ -213,9 +211,6 @@ def run() -> int:
         print("  ✓ Codex needs no hook — turn boundaries come from its rollout log.")
     elif agent_cls.name == "claude-code":
         _register_claude_hook()
-    elif agent_cls.name not in ATTACH_SUPPORTED:
-        print(f"  ⚠️  {agent_cls.label} has no live-transcript reader yet — progress/typing won't "
-              "work in attach mode. Codex and Claude Code are fully supported.")
 
     if not cfg.allowed_user_ids:
         print("⚠️  No authorized user — add your id to 'allowed_user_ids' before using the bot.")
