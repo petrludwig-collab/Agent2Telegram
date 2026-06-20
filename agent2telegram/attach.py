@@ -244,6 +244,13 @@ class AttachBridge:
             log.error("inject failed: %s", e)
             self._turn_active.clear()
 
+    def _poke_typing(self) -> None:
+        """Re-assert "typing…" immediately. Sending a message momentarily replaces the typing
+        indicator with the message; firing the action again right after closes that gap instead
+        of waiting up to TYPING_INTERVAL for the loop to come back around."""
+        if self._turn_active.is_set() and self._owner_chat is not None:
+            self.tg.send_chat_action(self._owner_chat, "typing")
+
     def _consume_turn_end(self) -> None:
         if self._turn_end is not None:
             try:
@@ -292,6 +299,7 @@ class AttachBridge:
                 self._status["mid"] = mid
                 self._status["shown"] = line
                 self._persist_status(mid)
+                self._poke_typing()      # creating the bubble is a send → re-show typing after
         else:
             self.tg.edit_plain(self._owner_chat, self._status["mid"], body, parse_mode="HTML")
             self._status["shown"] = line
@@ -398,6 +406,7 @@ class AttachBridge:
                     # place (no per-tool flicker); it's only removed when content appears or at end.
                     self._status_clear()
                     self.tg.send_message(self._owner_chat, out)
+                    self._poke_typing()                  # re-show typing right after the message
             # 2) Tool calls AFTER the text → a fresh live status bubble for the next steps.
             for b in blocks:
                 if isinstance(b, dict) and b.get("type") == "tool_use":
