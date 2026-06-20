@@ -21,8 +21,11 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
-def _cmd_run(_args) -> int:
+def _cmd_run(args) -> int:
+    import os
     from .config import load, ConfigError
+    if getattr(args, "config", None):
+        os.environ["AGENT2TELEGRAM_CONFIG"] = args.config   # run a specific bridge's config
     try:
         cfg = load()
     except ConfigError as e:
@@ -72,7 +75,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-V", "--version", action="version", version=f"agent2telegram {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("setup", help="interactive setup wizard")
-    sub.add_parser("run", help="start the bridge")
+    run_p = sub.add_parser("run", help="start the bridge")
+    run_p.add_argument("--config", help="path to a specific config (run multiple bridges from one install)")
     sub.add_parser("service", help="print a systemd/launchd service unit")
     sub.add_parser("doctor", help="diagnose config and agent availability")
     st = sub.add_parser("selftest", help="end-to-end attach test against a real agent (no bot)")
