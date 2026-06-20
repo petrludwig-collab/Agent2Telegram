@@ -19,6 +19,7 @@ import logging
 import os
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 from .config import Config
@@ -26,6 +27,40 @@ from .session import TmuxSession
 from .telegram import TelegramClient
 
 log = logging.getLogger("agent2telegram.attach")
+
+#: How long the transcript must be quiet before we consider a turn finished.
+IDLE_DONE = 10.0
+
+
+def _short(s: str, n: int = 58) -> str:
+    s = " ".join(str(s).split()).replace("**", "").replace("`", "")
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def _tool_summary(name: str, inp: dict) -> str:
+    """A short human line describing a tool call, for the live status bubble."""
+    inp = inp if isinstance(inp, dict) else {}
+    if name == "Bash":
+        return "🛠️ " + _short(inp.get("description") or inp.get("command", "command"))
+    if name == "Read":
+        return "📄 Reading " + _short(os.path.basename(inp.get("file_path", "")) or "file")
+    if name in ("Edit", "Write", "NotebookEdit"):
+        return "✏️ Editing " + _short(os.path.basename(inp.get("file_path", "")) or "file")
+    if name in ("Grep", "Glob"):
+        return "🔎 Searching " + _short(inp.get("pattern", ""))
+    if name == "WebFetch":
+        try:
+            host = urllib.parse.urlparse(inp.get("url", "")).netloc or inp.get("url", "")
+        except Exception:
+            host = inp.get("url", "")
+        return "🌐 Web " + _short(host)
+    if name == "WebSearch":
+        return "🔎 Web search: " + _short(inp.get("query", ""))
+    if name in ("Agent", "Task"):
+        return "🤖 " + _short(inp.get("description") or "subagent")
+    if name.startswith("mcp__"):
+        return "🔌 " + _short(name.replace("mcp__", "").replace("__", " "))
+    return "🛠️ " + _short(name or "tool")
 
 
 class AttachBridge:
@@ -48,6 +83,8 @@ class AttachBridge:
         self._turn_active = threading.Event()
         self._turn_from_tg = False           # is the current transcript turn Telegram-originated?
         self._last_activity = 0.0            # monotonic ts of last transcript activity (for typing)
+        self._status = {"mid": None, "lines": [], "shown": ""}   # live tool-call status bubble
+        self._seen_tools: set = set()
 
     # ---- lifecycle ---------------------------------------------------------
     def run(self) -> None:
@@ -161,9 +198,36 @@ class AttachBridge:
             try:
                 self._drain_transcript()
                 self._drain_signal()
+                # Turn finished (transcript quiet) → remove the live status bubble, stop typing.
+                if self._turn_active.is_set() and time.monotonic() - self._last_activity > IDLE_DONE:
+                    self._status_clear()
+                    self._turn_active.clear()
             except Exception as e:
                 log.error("outbound error: %s", e)
             self._stop.wait(0.4)
+
+    # ---- live tool-call status bubble (shown during the turn, deleted at the end) ------
+    def _status_push(self, line: str) -> None:
+        if self._owner_chat is None:
+            return
+        self._status["lines"].append(line)
+        text = "🛠️ Working…\n" + "\n".join(self._status["lines"][-8:])
+        if text == self._status["shown"]:
+            return
+        if self._status["mid"] is None:
+            mid = self.tg.send_plain_id(self._owner_chat, text)
+            if mid:
+                self._status["mid"] = mid
+                self._status["shown"] = text
+        else:
+            self.tg.edit_plain(self._owner_chat, self._status["mid"], text)
+            self._status["shown"] = text
+
+    def _status_clear(self) -> None:
+        if self._status["mid"] is not None and self._owner_chat is not None:
+            self.tg.delete_message(self._owner_chat, self._status["mid"])
+        self._status = {"mid": None, "lines": [], "shown": ""}
+        self._seen_tools.clear()
 
     def _drain_signal(self) -> None:
         if not self._signal or not self._signal.exists():
@@ -215,9 +279,17 @@ class AttachBridge:
                 continue
             if typ != "assistant" or not self._turn_from_tg:
                 continue
-            text = "\n".join(
-                b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
-            ).strip() if isinstance(content, list) else ""
+            blocks = content if isinstance(content, list) else []
+            # Tool calls → live status bubble (edited in place, deleted at turn end).
+            for b in blocks:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    tid = b.get("id")
+                    if tid and tid not in self._seen_tools:
+                        self._seen_tools.add(tid)
+                        self._status_push(_tool_summary(b.get("name", ""), b.get("input")))
+            # Text → a kept progress message.
+            text = "\n".join(b.get("text", "") for b in blocks
+                             if isinstance(b, dict) and b.get("type") == "text").strip()
             if not text:
                 continue
             uuid = rec.get("uuid", "")
@@ -237,13 +309,9 @@ class AttachBridge:
 
     # ---- typing indicator --------------------------------------------------
     def _typing_loop(self) -> None:
-        IDLE_DONE = 10.0   # turn is considered finished after this much transcript silence
         while not self._stop.is_set():
-            if self._turn_active.is_set():
-                if time.monotonic() - self._last_activity > IDLE_DONE:
-                    self._turn_active.clear()                 # gone quiet → turn done, stop typing
-                elif self._owner_chat is not None:
-                    self.tg.send_chat_action(self._owner_chat, "typing")
+            if self._turn_active.is_set() and self._owner_chat is not None:
+                self.tg.send_chat_action(self._owner_chat, "typing")
             self._stop.wait(3)
 
     # ---- media helpers (reuse the same download/STT as one-shot mode) ------

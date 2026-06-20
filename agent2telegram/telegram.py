@@ -165,6 +165,27 @@ class TelegramClient:
                 self._backoff(attempt)
         raise TelegramError(f"download failed: {last}")
 
+    def send_plain_id(self, chat_id: int, text: str) -> int | None:
+        """Send a plain-text message and return its message_id (for editable status bubbles)."""
+        try:
+            r = self._call("sendMessage", {"chat_id": chat_id, "text": text,
+                                           "disable_web_page_preview": "true"})
+            return r.get("message_id")
+        except TelegramError:
+            return None
+
+    def edit_plain(self, chat_id: int, message_id: int, text: str) -> None:
+        try:
+            self._call("editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": text})
+        except TelegramError:
+            pass
+
+    def delete_message(self, chat_id: int, message_id: int) -> None:
+        try:
+            self._call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+        except TelegramError:
+            pass
+
     def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
         try:
             self._call("sendChatAction", {"chat_id": chat_id, "action": action}, timeout=15)
