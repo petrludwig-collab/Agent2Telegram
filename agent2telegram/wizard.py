@@ -358,10 +358,14 @@ def _detect_agent_in_session(session: str):
         if p in cmd:
             cmds.append(cmd[p])
         stack.extend(children.get(p, []))
-    blob = " ".join(cmds)
+    # Match each command on its own (so the regex's ^ anchor is per-command, not lost in a join),
+    # and anchor the binary only at start-of-string or a path '/', with no trailing anchor — so it
+    # also catches node-wrapper forms like '/.../claude-code/cli.js'.
     for cls in adapters.available():
-        if cls.name in ATTACH_SUPPORTED and cls.binary and \
-                re.search(rf"(?:^|/){re.escape(cls.binary)}(?:\s|$)", blob):
+        if cls.name not in ATTACH_SUPPORTED or not cls.binary:
+            continue
+        pat = re.compile(rf"(?:^|/){re.escape(cls.binary)}")
+        if any(pat.search(c) for c in cmds):
             return cls
     return None
 
