@@ -48,11 +48,18 @@ if "$PY" -m pip --version >/dev/null 2>&1 || "$PY" -m ensurepip --upgrade >/dev/
 fi
 if [ "$INSTALLED" = 1 ]; then
   RUN=("$PY" -m agent2telegram)
-  HOW="$PY -m agent2telegram"
+  HOW="agent2telegram"
 else
-  say "pip unavailable — running directly from the clone (no install needed; it's dependency-free)."
-  RUN=(env "PYTHONPATH=$SRC" "$PY" -m agent2telegram)
-  HOW="PYTHONPATH=$SRC $PY -m agent2telegram"
+  # No pip: drop a tiny launcher so `agent2telegram` is still a real command (not a long
+  # PYTHONPATH line you have to remember for every update/connect).
+  say "pip unavailable — installing a launcher in ~/.local/bin (dependency-free)."
+  mkdir -p "$HOME/.local/bin"
+  printf '#!/bin/sh\nexec env PYTHONPATH="%s" "%s" -m agent2telegram "$@"\n' "$SRC" "$PY" > "$HOME/.local/bin/agent2telegram"
+  chmod +x "$HOME/.local/bin/agent2telegram"
+  case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc";; esac
+  export PATH="$HOME/.local/bin:$PATH"
+  RUN=("$HOME/.local/bin/agent2telegram")
+  HOW="agent2telegram"
 fi
 
 # 4) Launch the setup wizard.
