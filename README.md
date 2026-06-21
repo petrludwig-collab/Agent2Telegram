@@ -152,6 +152,23 @@ uninstall`; add `--yes` to skip the confirmation prompt.)
 
 ---
 
+## Proactive notifications (cron / background jobs)
+
+The bridge forwards the agent's replies **during a Telegram‑originated turn**. A cron job, a
+background task, or a long build can't reach you that way — there's no turn to reply in. For
+those, push a message to yourself with:
+
+```bash
+python3 -m agent2telegram notify "build finished ✅"
+echo "deploy done" | python3 -m agent2telegram notify          # or pipe it on stdin
+python3 -m agent2telegram notify --config ~/.config/agent2telegram/codex-config.json "…"
+```
+
+It sends to the configured owner via the bot (Markdown rendered, same as chat replies). Handy
+in a `cron` line or at the end of a script so the agent tells you when something finishes.
+
+---
+
 ## Voice messages (optional)
 
 Voice notes are transcribed with **ElevenLabs Scribe** (`scribe_v1`) and the transcript is

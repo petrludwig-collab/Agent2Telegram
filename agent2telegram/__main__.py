@@ -43,6 +43,39 @@ def _cmd_run(args) -> int:
     return 0
 
 
+def _cmd_notify(args) -> int:
+    """Push a message to the configured owner via the bot — for PROACTIVE notifications from
+    cron jobs, background tasks or scripts (e.g. "build finished ✅"). This is the supported way
+    for the agent to reach you unprompted: the bridge only forwards replies during a Telegram-
+    originated turn, so a background job can't deliver through the normal chat flow — it calls
+    this instead."""
+    import os
+    from .config import load, ConfigError
+    if getattr(args, "config", None):
+        os.environ["AGENT2TELEGRAM_CONFIG"] = args.config
+    try:
+        cfg = load()
+    except ConfigError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    text = args.message if args.message is not None else sys.stdin.read()
+    text = (text or "").strip()
+    if not text:
+        print("✗ nothing to send (pass a message or pipe it on stdin)", file=sys.stderr)
+        return 2
+    if not cfg.allowed_user_ids:
+        print("✗ no owner to notify (allowed_user_ids is empty)", file=sys.stderr)
+        return 2
+    from .telegram import TelegramClient, TelegramError
+    try:
+        TelegramClient(cfg.token).send_message(cfg.allowed_user_ids[0], text)
+    except TelegramError as e:
+        print(f"✗ send failed: {e}", file=sys.stderr)
+        return 1
+    print("✓ sent")
+    return 0
+
+
 def _cmd_doctor(_args) -> int:
     from .config import load, ConfigError
     from . import adapters
@@ -153,6 +186,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("setup", help="interactive setup wizard")
     run_p = sub.add_parser("run", help="start the bridge")
     run_p.add_argument("--config", help="path to a specific config (run multiple bridges from one install)")
+    nt = sub.add_parser("notify", help="push a message to the owner (for cron/background jobs)")
+    nt.add_argument("message", nargs="?", help="text to send (omit to read from stdin)")
+    nt.add_argument("--config", help="path to a specific bridge config")
     sub.add_parser("service", help="print a systemd/launchd service unit")
     sub.add_parser("doctor", help="diagnose config and agent availability")
     st = sub.add_parser("selftest", help="end-to-end attach test against a real agent (no bot)")
@@ -170,6 +206,8 @@ def main(argv: list[str] | None = None) -> int:
         return wizard.run()
     if args.command == "run":
         return _cmd_run(args)
+    if args.command == "notify":
+        return _cmd_notify(args)
     if args.command == "service":
         from . import service
         return service.print_instructions()
