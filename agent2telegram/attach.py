@@ -110,6 +110,13 @@ class AttachBridge:
         # long thinking and off exactly at turn end). Codex needs none — its rollout records
         # task_complete, so the reader signals turn end directly.
         self._turn_end = (self._signal.parent / "turn_end") if self._signal else None
+        # Outbound-loop heartbeat: touched at the end of every forward cycle (see _outbound_loop).
+        # The process and the inbound poller can stay alive while forwarding is wedged — a blocking
+        # send or a persistent exception freezes replies silently. A watchdog notices this file go
+        # stale and restarts the bridge. Per-bridge (keyed on the tmux session) so several bridges
+        # from one install don't share a heartbeat.
+        _slug = "".join(c if (c.isalnum() or c in "._-") else "_" for c in (cfg.tmux_session or "bridge"))
+        self._heartbeat = (self._signal.parent / f"outbound_heartbeat_{_slug}") if self._signal else None
         # Codex writes a fresh rollout-*.jsonl per session under ~/.codex/sessions; auto-detect
         # the newest one (and re-detect if the session restarts). Claude Code uses a fixed path.
         self._transcript = self._resolve_transcript()
@@ -577,9 +584,21 @@ class AttachBridge:
                 elif self._turn_active.is_set() and time.monotonic() - self._last_activity > IDLE_DONE:
                     self._status_clear()
                     self._turn_active.clear()
+                self._beat()                  # reached only on a full, non-blocking forward cycle
             except Exception as e:
                 log.error("outbound error: %s", e)
             self._stop.wait(0.4)
+
+    def _beat(self) -> None:
+        """Touch the outbound heartbeat — proof the forward loop completed a cycle without blocking.
+        A wedged send or a persistent exception never reaches here, so the file goes stale and a
+        watchdog can restart the bridge."""
+        if self._heartbeat is None:
+            return
+        try:
+            self._heartbeat.write_text(str(int(time.time())), encoding="utf-8")
+        except OSError:
+            pass
 
     # ---- live tool-call status bubble (shown during the turn, deleted at the end) ------
     def _status_push(self, line: str) -> None:
