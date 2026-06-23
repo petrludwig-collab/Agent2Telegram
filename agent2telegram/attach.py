@@ -131,6 +131,11 @@ class AttachBridge:
             self._sent_keys: set = set(self._sent_path.read_text("utf-8").split())
         except OSError:
             self._sent_keys = set()
+        # Durable outbound queue: a reply whose send HARD-fails (network reset, etc.) is persisted
+        # here and re-sent by the outbound loop until Telegram confirms — so a turn's answer is
+        # NEVER silently lost. Survives restarts (re-loaded below). Per-bridge (tmux slug).
+        self._queue_path = (self._signal.parent / f"outbound_queue_{_slug}.jsonl") if self._signal else None
+        self._pending_send: list = self._load_queue()
         self._tpos = 0
         self._turn_active = threading.Event()
         self._turn_from_tg = False           # is the current transcript turn Telegram-originated?
@@ -355,6 +360,76 @@ class AttachBridge:
         except OSError:
             pass
 
+    # ---- durable outbound delivery (never drop a reply) --------------------
+    def _load_queue(self) -> list:
+        if self._queue_path is None or not self._queue_path.exists():
+            return []
+        out = []
+        try:
+            for line in self._queue_path.read_text("utf-8").splitlines():
+                line = line.strip()
+                if line:
+                    out.append(json.loads(line))
+        except (OSError, ValueError):
+            return []
+        return out
+
+    def _persist_queue(self) -> None:
+        if self._queue_path is None:
+            return
+        try:
+            self._queue_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._queue_path.parent / (self._queue_path.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                for item in self._pending_send:
+                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            tmp.replace(self._queue_path)          # atomic, no os import needed
+        except OSError:
+            pass
+
+    def _enqueue(self, text: str, key: str | None) -> None:
+        self._pending_send.append({"text": text, "key": key})
+        self._persist_queue()
+
+    def _send_final(self, text: str, key: str | None = None) -> None:
+        """Forward one reply RELIABLY. Marks the dedup ledger only AFTER a confirmed send; on any
+        send failure the reply is queued to disk and the outbound loop keeps retrying until Telegram
+        confirms. Order is preserved: if anything is already queued, this appends behind it."""
+        if not text or self._owner_chat is None:
+            return
+        if key and key in self._sent_keys:
+            return
+        if self._pending_send:                       # something already waiting → keep FIFO order
+            self._enqueue(text, key)
+            return
+        try:
+            self.tg.send_message(self._owner_chat, text)
+        except Exception as e:                        # network reset, 5xx after retries, etc.
+            log.warning("forward failed → queued for re-delivery: %s", e)
+            self._enqueue(text, key)
+            return
+        if key:
+            self._mark_sent(key)
+        self._turn_text_sent = True
+        log.info("FWD (send) %r", text[:30])
+
+    def _flush_pending(self) -> None:
+        """Re-send queued replies FIFO until one fails (then stop, preserving order for next pass).
+        Called every outbound cycle, so a transient network failure self-heals within ~0.4 s."""
+        while self._pending_send and self._owner_chat is not None:
+            item = self._pending_send[0]
+            try:
+                self.tg.send_message(self._owner_chat, item.get("text", ""))
+            except Exception as e:
+                log.warning("re-delivery still failing (%d queued): %s", len(self._pending_send), e)
+                return
+            self._pending_send.pop(0)
+            self._persist_queue()
+            if item.get("key"):
+                self._mark_sent(item["key"])
+            self._turn_text_sent = True
+            log.info("FWD (re-delivered) %r", str(item.get("text", ""))[:30])
+
     # ---- inbound (Telegram → session) -------------------------------------
     def _inbound_loop(self) -> None:
         offset = 0
@@ -570,6 +645,7 @@ class AttachBridge:
         while not self._stop.is_set():
             try:
                 self._maybe_reresolve()
+                self._flush_pending()         # re-deliver any reply a prior send failed to push
                 self._drain_transcript()      # may set _pending_turn_end (Codex task_complete)
                 self._drain_signal()
                 # End-of-turn detection, in priority order:
@@ -661,7 +737,7 @@ class AttachBridge:
             return
         if answer and self._owner_chat is not None:
             self._status_clear()                         # final message → drop the technical bubble
-            self.tg.send_message(self._owner_chat, answer)
+            self._send_final(answer)                     # reliable: queue + retry on send failure
             self._turn_active.clear()
 
     def _drain_transcript(self) -> None:
@@ -724,15 +800,12 @@ class AttachBridge:
         if ev.kind == "text":
             out = self._strip_marker(ev.text)
             if out and ev.key not in self._sent_keys:
-                self._mark_sent(ev.key)         # ledger dedups across restarts
                 # A new progress message → delete the current technical bubble so the next tool
                 # calls re-create it BELOW this message (the bubble always trails at the bottom).
                 self._status_clear()
-                _t0 = time.monotonic()
-                self.tg.send_message(self._owner_chat, out)
-                self._turn_text_sent = True     # release held tool bubbles — text landed first
-                log.info("FWD +%.1fs (send %.1fs) %r",
-                         _t0 - self._turn_started, time.monotonic() - _t0, out[:30])
+                # Reliable forward: the dedup ledger is marked only AFTER a confirmed send, and a
+                # failed send is queued + retried — so a reply is never silently dropped.
+                self._send_final(out, key=ev.key)
         elif ev.kind == "tool":
             if self.cfg.agent == "codex":
                 return                            # Codex tools come live from the TUI scraper
