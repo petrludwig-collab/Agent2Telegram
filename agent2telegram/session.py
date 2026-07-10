@@ -65,16 +65,21 @@ class TmuxSession:
     def __init__(self, agent_argv: list[str], *, cwd: Path, name: str | None = None,
                  timeout: int = 600, idle: float = 1.5, settle: float = 0.4,
                  origin_prefix: str = "", signal_file: Path | None = None,
-                 boot_wait: float = 2.0) -> None:
+                 boot_wait: float = 2.0, submit: str = "enter") -> None:
         if shutil.which("tmux") is None:
             raise SessionError("tmux is not installed. Install tmux (e.g. `brew install tmux` "
                                "or `apt install tmux`) — the persistent session needs it.")
+        if submit not in {"enter", "csi-u"}:
+            raise ValueError("submit must be 'enter' or 'csi-u'")
         self.name = name or ("a2t_" + uuid.uuid4().hex[:10])
         self._timeout = timeout
         self._idle = idle
         self._settle = settle
         self._origin = origin_prefix
         self._signal = signal_file
+        # Claude Code's current TUI does not submit reliably via tmux's synthetic Enter.
+        # It accepts the terminal's CSI-u Enter sequence instead; codex/generic keep Enter.
+        self._submit = submit
         cwd.mkdir(parents=True, exist_ok=True)
         if not self._exists():
             if not agent_argv:
@@ -101,9 +106,15 @@ class TmuxSession:
         text = " ".join(text.splitlines())                 # one Enter submits everything
         if self._origin:
             text = f"{self._origin}{text}"
-        _tmux("send-keys", "-t", self.name, "C-u"); time.sleep(0.05)
-        _tmux("send-keys", "-t", self.name, "-l", "--", text); time.sleep(0.15)
-        _tmux("send-keys", "-t", self.name, "Enter")
+        if self._submit == "csi-u":
+            # Give the TUI enough time to process the literal paste before submitting.
+            _tmux("send-keys", "-t", self.name, "C-u"); time.sleep(0.3)
+            _tmux("send-keys", "-t", self.name, "-l", "--", text); time.sleep(0.6)
+            _tmux("send-keys", "-t", self.name, "-l", "\x1b[13u")
+        else:
+            _tmux("send-keys", "-t", self.name, "C-u"); time.sleep(0.05)
+            _tmux("send-keys", "-t", self.name, "-l", "--", text); time.sleep(0.15)
+            _tmux("send-keys", "-t", self.name, "Enter")
 
     def _capture(self) -> str:
         return _tmux("capture-pane", "-p", "-t", self.name, check=False).stdout

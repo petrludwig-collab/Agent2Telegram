@@ -122,7 +122,8 @@ class AttachBridge:
         self._transcript = self._resolve_transcript()
         self._last_resolve = 0.0
         self._session = TmuxSession([], name=cfg.tmux_session, cwd=Path.home(),
-                                    origin_prefix=cfg.origin_prefix, boot_wait=0)
+                                    origin_prefix=cfg.origin_prefix, boot_wait=0,
+                                    submit=("csi-u" if cfg.agent == "claude-code" else "enter"))
         self._stop = threading.Event()
         # Persisted ledger of already-forwarded message uuids — survives restarts/crashes/reboots
         # so resuming an interrupted turn never re-sends what was already delivered.
