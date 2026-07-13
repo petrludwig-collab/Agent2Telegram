@@ -89,7 +89,11 @@ def _launch_agent(agent_cls, session: str, workdir: Path) -> bool:
     for _ in range(24):
         time.sleep(1)
         pane = _capture(session).lower()
-        if "trust" in pane or "continue" in pane or "yes, proceed" in pane:
+        if "update available!" in pane and "press enter to continue" in pane:
+            _tmux("send-keys", "-t", session, "2", "Enter", check=False)
+            time.sleep(1)
+            continue
+        if "trust" in pane or "yes, proceed" in pane:
             _tmux("send-keys", "-t", session, "Enter", check=False)
         if "›" in _capture(session) or "❯" in _capture(session):
             time.sleep(2)

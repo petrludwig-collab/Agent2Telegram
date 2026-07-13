@@ -18,6 +18,7 @@ import glob
 import html
 import json
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -49,6 +50,8 @@ BOT_COMMANDS = [
     {"command": "start", "description": "Intro and what you can send"},
     {"command": "help", "description": "Intro and what you can send"},
     {"command": "status", "description": "Connection and voice status"},
+    {"command": "health", "description": "Quick bridge and session health"},
+    {"command": "diag", "description": "Safe diagnostics for the owner"},
     {"command": "setkey", "description": "Enable voice (your ElevenLabs API key)"},
     {"command": "id", "description": "Show your Telegram id"},
 ]
@@ -62,6 +65,47 @@ from .readers import _short  # noqa: E402
 _TUI_VERBS = {"Read": "📄", "List": "📂", "Search": "🔎", "Ran": "🛠️",
               "Edit": "✏️", "Wrote": "✏️", "Added": "✏️", "Updated": "✏️",
               "Deleted": "🗑️", "Removed": "🗑️"}
+
+
+def _blocking_session_prompt(pane: str) -> str | None:
+    """Identify known interactive screens that are unsafe for Telegram key injection."""
+    text = (pane or "").lower()
+    if "update available!" in text and "press enter to continue" in text:
+        return "codex_update_prompt"
+    if "trust" in text and ("press enter" in text or "continue" in text):
+        return "workspace_trust_prompt"
+    return None
+
+
+def _empty_turn_notice(pane: str) -> tuple[str, str]:
+    """Classify a Codex turn that completed without an assistant message.
+
+    Codex prints quota failures in the TUI but records only ``task_complete`` with a null
+    ``last_agent_message`` in its rollout. Inspect only the bottom of the pane, where the result
+    of the just-finished prompt is rendered, so an older visible quota error cannot taint a later
+    empty turn.
+    """
+    tail = "\n".join((pane or "").splitlines()[-12:])
+    lower = tail.lower()
+    if "you've hit your usage limit" in lower or "you have hit your usage limit" in lower:
+        retry = _re.search(r"try\s+again\s+at\s+([^\n.]+(?:\.[mM]\.)?)", tail, _re.IGNORECASE)
+        when = f" Další pokus je možný přibližně v {retry.group(1).strip()}." if retry else ""
+        return (
+            "usage_limit",
+            "⚠️ Codex narazil na limit používání a požadavek proto nedokončil." + when
+            + " Zadání nebylo potichu zahazeno; po obnovení kapacity jej pošlete znovu.",
+        )
+    if "rate limit" in lower or "too many requests" in lower:
+        return (
+            "rate_limit",
+            "⚠️ Codex narazil na dočasný rate limit a požadavek nedokončil. "
+            "Po krátké době jej prosím pošlete znovu.",
+        )
+    return (
+        "empty_response",
+        "⚠️ Codex ukončil požadavek bez odpovědi. Bridge zůstal aktivní, ale nemá žádný "
+        "výsledek k doručení; požadavek prosím zopakujte.",
+    )
 
 
 def _extract_tui_tools(pane: str) -> list:
@@ -136,8 +180,19 @@ class AttachBridge:
         # NEVER silently lost. Survives restarts (re-loaded below). Per-bridge (tmux slug).
         self._queue_path = (self._signal.parent / f"outbound_queue_{_slug}.jsonl") if self._signal else None
         self._pending_send: list = self._load_queue()
+        # In-flight Telegram task ledger.  Unlike the Codex transcript this is tiny, explicit and
+        # independent of the agent process, so a brand-new tmux session after a machine reboot can
+        # continue the task that was active when power went away.  boot_id distinguishes a bridge
+        # crash (same tmux/task still running: do not inject twice) from a real reboot.
+        self._task_path = (self._signal.parent / f"inflight_task_{_slug}.json") if self._signal else None
+        self._inflight_task = self._load_inflight_task()
         self._tpos = 0
+        # Byte offset at which the current injected Telegram turn began. The turn-end backstop
+        # must never recover assistant text from before this boundary: Codex can legitimately
+        # complete an acknowledgement-only turn with last_agent_message=null.
+        self._turn_transcript_start = 0
         self._turn_active = threading.Event()
+        self._task_started = threading.Event()  # Codex transcript acknowledgement of submission
         self._turn_from_tg = False           # is the current transcript turn Telegram-originated?
         self._last_activity = 0.0            # monotonic ts of last transcript activity (for typing)
         self._status = {"mid": None, "shown": ""}   # live one-line tool-call status bubble
@@ -151,6 +206,8 @@ class AttachBridge:
         self._seen_tools: set = set()
         self._tui_seen: set = set()          # Codex TUI scrape: tool lines already shown this turn
         self._turn_text_sent = False         # has any text been forwarded this turn (bubble gate)
+        self._bridge_started = time.monotonic()
+        self._idle_warned = False
 
     # ---- transcript resolution --------------------------------------------
     def _codex_sessions_dir(self) -> Path:
@@ -295,11 +352,17 @@ class AttachBridge:
     # ---- lifecycle ---------------------------------------------------------
     def run(self) -> None:
         me = self.tg.get_me()
-        log.info("Attach bridge live as @%s → tmux '%s', owner=%s",
-                 me.get("username"), self.cfg.tmux_session, self._owner_chat)
+        log.info("BRIDGE_STARTED bot=@%s tmux=%s owner=%s agent=%s",
+                 me.get("username"), self.cfg.tmux_session, self._owner_chat, self.cfg.agent)
         self.tg.set_my_commands(BOT_COMMANDS)    # enable the "/" command menu in Telegram
         if not self._session.alive:
             raise RuntimeError(f"tmux session '{self.cfg.tmux_session}' not found")
+        blocked = _blocking_session_prompt(self._session._capture())
+        if blocked:
+            raise RuntimeError(
+                f"tmux session '{self.cfg.tmux_session}' is not ready: {blocked}; "
+                "resolve the prompt in tmux before starting the bridge"
+            )
         # Start tailing at EOF. If we've run before (the ledger has entries), rewind to the start
         # of the current turn so a reply written while we were restarting still gets forwarded —
         # the ledger dedups, so nothing already delivered is re-sent. On the very first run we do
@@ -315,7 +378,14 @@ class AttachBridge:
         if self.cfg.agent == "codex":
             # Codex logs tools to the rollout only at completion → scrape the TUI for LIVE bubbles.
             threading.Thread(target=self._tui_scrape_loop, daemon=True).start()
-        self._inbound_loop()
+        self._restore_inflight_task()
+        try:
+            self._inbound_loop()
+        except BaseException:
+            log.exception("BRIDGE_STOPPED reason=unhandled_exception")
+            raise
+        else:
+            log.info("BRIDGE_STOPPED reason=normal")
 
     def _resume_position(self) -> None:
         """Find the most recent non-empty user message and rewind ``_tpos`` to just after it,
@@ -361,6 +431,91 @@ class AttachBridge:
             pass
 
     # ---- durable outbound delivery (never drop a reply) --------------------
+    @staticmethod
+    def _boot_id() -> str:
+        try:
+            return Path("/proc/sys/kernel/random/boot_id").read_text("utf-8").strip()
+        except OSError:
+            return "unknown"
+
+    def _load_inflight_task(self) -> dict | None:
+        if self._task_path is None or not self._task_path.exists():
+            return None
+        try:
+            value = json.loads(self._task_path.read_text("utf-8"))
+            return value if isinstance(value, dict) and value.get("text") else None
+        except (OSError, ValueError) as e:
+            log.error("TASK_LOAD_FAILED path=%s error=%s", self._task_path, e)
+            return None
+
+    def _persist_inflight_task(self, text: str, *, message_id: int | None = None) -> None:
+        if self._task_path is None:
+            return
+        task = {
+            "text": text,
+            "message_id": message_id,
+            "accepted_at": int(time.time()),
+            "accepted_boot_id": self._boot_id(),
+            "resumed_boot_id": None,
+        }
+        try:
+            self._task_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._task_path.parent / (self._task_path.name + ".tmp")
+            tmp.write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", "utf-8")
+            tmp.replace(self._task_path)
+            self._inflight_task = task
+        except OSError as e:
+            # Never inject a task that we failed to journal: that would recreate the original
+            # silent-loss window on reboot.
+            raise RuntimeError(f"could not persist in-flight task: {e}") from e
+
+    def _write_inflight_task(self) -> None:
+        if self._task_path is None or not self._inflight_task:
+            return
+        tmp = self._task_path.parent / (self._task_path.name + ".tmp")
+        tmp.write_text(json.dumps(self._inflight_task, ensure_ascii=False, indent=2) + "\n", "utf-8")
+        tmp.replace(self._task_path)
+
+    def _clear_inflight_task(self) -> None:
+        self._inflight_task = None
+        if self._task_path is not None:
+            try:
+                self._task_path.unlink()
+            except OSError:
+                pass
+
+    def _restore_inflight_task(self) -> None:
+        """Restore turn routing after a bridge crash; inject once after an actual machine reboot."""
+        task = self._inflight_task
+        if not task:
+            return
+        self._turn_active.set()
+        self._turn_from_tg = True
+        self._last_activity = time.monotonic()
+        current_boot = self._boot_id()
+        if task.get("accepted_boot_id") == current_boot or task.get("resumed_boot_id") == current_boot:
+            log.info("TASK_RESTORE mode=same_boot action=follow_existing_turn")
+            return
+
+        # Claim this boot before injection.  If the bridge itself crashes during resume, its next
+        # start follows the existing tmux turn instead of submitting a duplicate.
+        task["resumed_boot_id"] = current_boot
+        task["resumed_at"] = int(time.time())
+        self._write_inflight_task()
+        if self._owner_chat is not None:
+            self.tg.send_message(
+                self._owner_chat,
+                "♻️ Server znovu naběhl. Automaticky navazuji na rozpracovaný úkol.",
+            )
+        resume = (
+            "Server/process byl během tohoto úkolu restartován. Automaticky pokračuj v původním "
+            "úkolu níže. Nejdřív zkontroluj aktuální stav a již provedené změny; neopakuj "
+            "nevratné kroky. Dokonči bezpečně zbývající práci, ověř výsledek a pošli uživateli "
+            "závěrečný stav.\n\nPŮVODNÍ ÚKOL:\n" + str(task["text"])
+        )
+        log.info("TASK_RESTORE mode=new_boot action=resume message_id=%s", task.get("message_id"))
+        self._inject(resume)
+
     def _load_queue(self) -> list:
         if self._queue_path is None or not self._queue_path.exists():
             return []
@@ -370,7 +525,8 @@ class AttachBridge:
                 line = line.strip()
                 if line:
                     out.append(json.loads(line))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as e:
+            log.error("QUEUE_LOAD_FAILED path=%s error=%s", self._queue_path, e)
             return []
         return out
 
@@ -384,8 +540,9 @@ class AttachBridge:
                 for item in self._pending_send:
                     f.write(json.dumps(item, ensure_ascii=False) + "\n")
             tmp.replace(self._queue_path)          # atomic, no os import needed
-        except OSError:
-            pass
+        except OSError as e:
+            log.error("QUEUE_PERSIST_FAILED path=%s queued=%d error=%s",
+                      self._queue_path, len(self._pending_send), e)
 
     def _enqueue(self, text: str, key: str | None) -> None:
         self._pending_send.append({"text": text, "key": key})
@@ -495,6 +652,7 @@ class AttachBridge:
         self._max_gap = 0.0
         self._last_typing = now
         self._turn_text_sent = False             # gate TUI bubbles until intro text lands
+        self._idle_warned = False
         # Seed the TUI dedup with tool lines ALREADY on screen from previous turns, so the
         # scraper only emits calls that appear DURING this turn — otherwise stale lines still
         # visible in the pane get re-sent as bubbles under the new turn.
@@ -517,13 +675,29 @@ class AttachBridge:
             note = self._download_note(msg, chat_id)
             text = f"{text}\n{note}".strip() if note else text
         if text:
+            try:
+                self._persist_inflight_task(text, message_id=msg.get("message_id"))
+            except Exception as e:
+                log.error("task journal failed: %s", e)
+                self._turn_active.clear()
+                self.tg.send_message(chat_id, "⚠️ Úkol se nepodařilo bezpečně uložit; nebyl spuštěn.")
+                return
             self._inject(text)
 
     def _inject(self, text: str) -> None:
         self._turn_active.set()
         self._last_activity = time.monotonic()   # keep typing lit from the very start
+        self._task_started.clear()
+        try:
+            transcript = getattr(self, "_transcript", None)
+            self._turn_transcript_start = transcript.stat().st_size if transcript else 0
+        except OSError:
+            self._turn_transcript_start = 0
         try:
             self._session.inject(text)
+            if self.cfg.agent == "codex" and not self._task_started.wait(2.0):
+                log.warning("SUBMIT_RETRY reason=no_task_started action=press_enter")
+                self._session.submit()
         except Exception as e:
             log.error("inject failed: %s", e)
             self._turn_active.clear()
@@ -543,7 +717,7 @@ class AttachBridge:
                 "progress, what tools it runs, and the reply. You can also send *photos* and "
                 "*files*, and react with ❤️ as quick feedback.\n\n"
                 f"🎤 Voice transcription: {voice}.\n\n"
-                "Commands: /help · /status · /id · /setkey")
+                "Commands: /help · /status · /health · /diag · /id · /setkey")
             return True
         if cmd == "id":
             self.tg.send_message(chat_id, f"Your Telegram id: `{chat_id}`")
@@ -553,6 +727,37 @@ class AttachBridge:
             self.tg.send_message(chat_id,
                 f"✅ Connected — *{agent}* in tmux session `{self.cfg.tmux_session}`.\n"
                 f"🎤 Voice (ElevenLabs): {voice}")
+            return True
+        if cmd == "health":
+            session_ok = self._session.alive
+            state = "working" if self._turn_active.is_set() else "idle"
+            pending = len(self._pending_send)
+            icon = "✅" if session_ok and pending == 0 else "⚠️"
+            self.tg.send_message(
+                chat_id,
+                f"{icon} Bridge: running\n"
+                f"tmux `{self.cfg.tmux_session}`: {'running' if session_ok else 'missing'}\n"
+                f"turn: {state}\n"
+                f"outbound queue: {pending}",
+            )
+            return True
+        if cmd == "diag":
+            from . import __version__
+            session_ok = self._session.alive
+            transcript = self._transcript.name if self._transcript else "not detected"
+            uptime = int(max(0.0, time.monotonic() - self._bridge_started))
+            self.tg.send_message(
+                chat_id,
+                "Agent2Telegram diagnostics\n"
+                f"version: `{__version__}`\n"
+                f"pid: `{os.getpid()}`\n"
+                f"uptime: `{uptime}s`\n"
+                f"agent: `{self.cfg.agent}`\n"
+                f"tmux: `{self.cfg.tmux_session}` ({'running' if session_ok else 'missing'})\n"
+                f"transcript: `{transcript}`\n"
+                f"turn active: `{self._turn_active.is_set()}`\n"
+                f"queued replies: `{len(self._pending_send)}`",
+            )
             return True
         if cmd == "setkey":
             return self._set_voice_key(arg, chat_id, message_id)
@@ -624,14 +829,19 @@ class AttachBridge:
                 pass
 
     def _last_assistant_text(self) -> str | None:
-        """The most recent assistant text in the transcript (the turn's final answer). Read-only
-        tail scan — used purely by the turn-end backstop, doesn't touch the live _tpos cursor."""
+        """Most recent assistant text written during the current injected Telegram turn.
+
+        The byte boundary is captured immediately before injection. This is intentionally scoped:
+        a valid Codex turn may finish with no assistant message, and falling back to text from an
+        earlier turn would duplicate a stale answer into Telegram.
+        """
         if not self._transcript:
             return None
         try:
             size = self._transcript.stat().st_size
+            start = min(size, max(0, self._turn_transcript_start))
             with open(self._transcript, "rb") as f:
-                f.seek(max(0, size - 2_000_000))
+                f.seek(max(start, size - 2_000_000))
                 tail = f.read()
         except OSError:
             return None
@@ -667,9 +877,20 @@ class AttachBridge:
             if out:
                 self._send_final(out)
                 log.info("TURN END backstop → forwarded final answer %r", out[:30])
+            else:
+                try:
+                    pane = self._session._capture()
+                except Exception as e:
+                    log.warning("EMPTY_TURN_CAPTURE_FAILED error=%s", e)
+                    pane = ""
+                reason, notice = _empty_turn_notice(pane)
+                self._send_final(notice)
+                log.warning("TURN END no_agent_answer reason=%s action=notify_owner", reason)
         self._turn_active.clear()
         self._pending_turn_end = False
         self._consume_turn_end()
+        if was_active:
+            self._clear_inflight_task()
         if was_active:
             log.info("TURN END t=%.2f dur=%.1fs typing_fired=%d max_gap=%.2fs",
                      time.time(), time.monotonic() - self._turn_started,
@@ -698,8 +919,16 @@ class AttachBridge:
                 elif self._turn_end is not None and self._turn_end.exists():
                     self._end_turn()
                 elif self._turn_active.is_set() and time.monotonic() - self._last_activity > IDLE_DONE:
-                    self._status_clear()
-                    self._turn_active.clear()
+                    if self._reader.emits_turn_end:
+                        if not self._idle_warned:
+                            log.warning(
+                                "TURN_STALLED reason=transcript_idle idle=%.1fs action=wait_for_authoritative_end",
+                                time.monotonic() - self._last_activity,
+                            )
+                            self._idle_warned = True
+                    else:
+                        log.warning("TURN_END_FALLBACK reason=idle_timeout idle=%.1fs", IDLE_DONE)
+                        self._finish_turn()
                 self._beat()                  # reached only on a full, non-blocking forward cycle
             except Exception as e:
                 log.error("outbound error: %s", e)
@@ -779,6 +1008,7 @@ class AttachBridge:
             self._status_clear()                         # final message → drop the technical bubble
             self._send_final(answer)                     # reliable: queue + retry on send failure
             self._turn_active.clear()
+            self._clear_inflight_task()
 
     def _drain_transcript(self) -> None:
         if not self._transcript or not self._transcript.exists():
@@ -831,6 +1061,7 @@ class AttachBridge:
             self._turn_from_tg = ev.text.lstrip().startswith(self._origins)
             return
         if ev.kind == "turn_start":
+            self._task_started.set()
             return                              # inbound already lit typing; nothing else to do
         if ev.kind == "turn_end":
             self._pending_turn_end = True       # outbound loop finishes the turn after this drain

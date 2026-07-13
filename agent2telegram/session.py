@@ -34,6 +34,12 @@ _SEP_RE = re.compile(r"^[\s─━—–_=·.\-]{6,}$")
 _STATUS_RE = re.compile(r"^[✻✶✳✢✺✷*]\s")           # spinner/status, e.g. "✻ Worked for 1s"
 _BULLET_RE = re.compile(r"^\s*[⏺●○•]\s?")           # assistant output bullet
 
+# tmux writes literal input to the TUI's pseudo-terminal faster than Codex can always consume it.
+# Give larger messages time to reach the prompt before Enter; keep normal chat messages snappy.
+_INPUT_SETTLE_BASE = 0.15
+_INPUT_SETTLE_CHARS_PER_SECOND = 8_000
+_INPUT_SETTLE_MAX = 1.5
+
 
 def _clean_tui(text: str) -> str:
     out = []
@@ -55,8 +61,10 @@ class SessionError(Exception):
     pass
 
 
-def _tmux(*args: str, check: bool = True, timeout: float = 10) -> subprocess.CompletedProcess:
-    return subprocess.run(["tmux", *args], capture_output=True, text=True, check=check, timeout=timeout)
+def _tmux(*args: str, check: bool = True, timeout: float = 10,
+          input_text: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(["tmux", *args], input=input_text, capture_output=True, text=True,
+                          check=check, timeout=timeout)
 
 
 class TmuxSession:
@@ -102,7 +110,17 @@ class TmuxSession:
         if self._origin:
             text = f"{self._origin}{text}"
         _tmux("send-keys", "-t", self.name, "C-u"); time.sleep(0.05)
-        _tmux("send-keys", "-t", self.name, "-l", "--", text); time.sleep(0.15)
+        if len(text) >= 500:
+            # Atomically hand long input to tmux instead of flooding the TUI with thousands of
+            # individual key events. -p wraps it in bracketed-paste markers; -d deletes the
+            # temporary buffer immediately after use.
+            _tmux("load-buffer", "-", input_text=text)
+            _tmux("paste-buffer", "-p", "-d", "-t", self.name)
+        else:
+            _tmux("send-keys", "-t", self.name, "-l", "--", text)
+        settle = min(_INPUT_SETTLE_MAX,
+                     _INPUT_SETTLE_BASE + len(text) / _INPUT_SETTLE_CHARS_PER_SECOND)
+        time.sleep(settle)
         _tmux("send-keys", "-t", self.name, "Enter")
 
     def _capture(self) -> str:
@@ -114,6 +132,12 @@ class TmuxSession:
         if not self.alive:
             raise SessionError(f"agent session '{self.name}' is gone")
         self._send_keys(text)
+
+    def submit(self) -> None:
+        """Retry only prompt submission without altering the text already in the TUI."""
+        if not self.alive:
+            raise SessionError(f"agent session '{self.name}' is gone")
+        _tmux("send-keys", "-t", self.name, "Enter")
 
     def send(self, text: str) -> str:
         if not self.alive:

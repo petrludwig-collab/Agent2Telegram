@@ -88,24 +88,40 @@ def _strip_markdown(text: str) -> str:
     return text.replace("**", "").replace("`", "")
 
 
+def _utf16_len(text: str) -> int:
+    """Length used by Telegram for message limits (UTF-16 code units)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _utf16_prefix(text: str, limit: int) -> int:
+    """Return a safe Python string index whose prefix fits *limit* UTF-16 units."""
+    used = 0
+    for index, char in enumerate(text):
+        used += 2 if ord(char) > 0xFFFF else 1
+        if used > limit:
+            return index
+    return len(text)
+
+
 def split_message(text: str, limit: int = MAX_MESSAGE_LEN) -> list[str]:
     """Split *text* into Telegram-sized chunks, preferring paragraph then line then
     word boundaries, and hard-splitting only as a last resort. Pure function — tested."""
     text = text or ""
-    if len(text) <= limit:
+    if _utf16_len(text) <= limit:
         return [text] if text else []
     chunks: list[str] = []
     remaining = text
-    while len(remaining) > limit:
-        window = remaining[:limit]
+    while _utf16_len(remaining) > limit:
+        prefix_end = _utf16_prefix(remaining, limit)
+        window = remaining[:prefix_end]
         # Prefer the latest natural boundary inside the window.
         for sep in ("\n\n", "\n", " "):
             cut = window.rfind(sep)
-            if cut > limit * 0.5:        # only if it doesn't waste too much of the window
+            if cut > len(window) * 0.5:  # only if it doesn't waste too much of the window
                 break
         else:
-            cut = limit                  # no good boundary: hard cut
-        cut = cut if cut > 0 else limit
+            cut = prefix_end             # no good boundary: hard cut
+        cut = cut if cut > 0 else prefix_end
         chunks.append(remaining[:cut].rstrip("\n"))
         remaining = remaining[cut:].lstrip("\n")
     if remaining:
@@ -242,23 +258,35 @@ class TelegramClient:
         except TelegramError:
             pass  # purely cosmetic; never let it break a turn
 
-    def send_message(self, chat_id: int, text: str, *, parse_mode: str = "auto") -> None:
+    def send_message(self, chat_id: int, text: str, *, parse_mode: str = "auto") -> list[int]:
         """Send text, splitting to Telegram's size limit. By default (``parse_mode="auto"``)
         the agent's Markdown is rendered via HTML; on any parse failure we fall back to plain
         text so a message is never lost to a formatting glitch."""
-        for chunk in split_message(text) or ["(empty response)"]:
+        chunks = split_message(text) or ["(empty response)"]
+        message_ids: list[int] = []
+        log.info("SEND_STARTED chars=%d parts=%d", len(text or ""), len(chunks))
+        for index, chunk in enumerate(chunks, 1):
             base = {"chat_id": chat_id, "disable_web_page_preview": "true"}
             if parse_mode == "auto":
                 try:
-                    self._call("sendMessage", {**base, "text": markdown_to_html(chunk), "parse_mode": "HTML"}, timeout=SEND_TIMEOUT)
+                    result = self._call("sendMessage", {**base, "text": markdown_to_html(chunk), "parse_mode": "HTML"}, timeout=SEND_TIMEOUT)
                 except TelegramError as e:
                     log.warning("HTML send failed, falling back to plain text: %s", e)
-                    self._call("sendMessage", {**base, "text": _strip_markdown(chunk)}, timeout=SEND_TIMEOUT)
+                    result = self._call("sendMessage", {**base, "text": _strip_markdown(chunk)}, timeout=SEND_TIMEOUT)
             elif parse_mode:
                 try:
-                    self._call("sendMessage", {**base, "text": chunk, "parse_mode": parse_mode}, timeout=SEND_TIMEOUT)
+                    result = self._call("sendMessage", {**base, "text": chunk, "parse_mode": parse_mode}, timeout=SEND_TIMEOUT)
                 except TelegramError as e:
                     log.warning("send failed with parse_mode=%s, retrying plain: %s", parse_mode, e)
-                    self._call("sendMessage", {**base, "text": chunk}, timeout=SEND_TIMEOUT)
+                    result = self._call("sendMessage", {**base, "text": chunk}, timeout=SEND_TIMEOUT)
             else:
-                self._call("sendMessage", {**base, "text": chunk}, timeout=SEND_TIMEOUT)
+                result = self._call("sendMessage", {**base, "text": chunk}, timeout=SEND_TIMEOUT)
+            message_id = result.get("message_id") if isinstance(result, dict) else None
+            if message_id is None:
+                raise TelegramError(f"sendMessage part {index}/{len(chunks)} returned no message_id")
+            message_ids.append(int(message_id))
+            log.info("PART_DELIVERED part=%d/%d chars=%d message_id=%s",
+                     index, len(chunks), len(chunk), message_id)
+        log.info("DELIVERED chars=%d parts=%d confirmed_ids=%d",
+                 len(text or ""), len(chunks), len(message_ids))
+        return message_ids

@@ -32,6 +32,13 @@ class SplitMessageTests(unittest.TestCase):
         self.assertEqual("".join(chunks), text)
         self.assertTrue(all(len(c) <= MAX_MESSAGE_LEN for c in chunks))
 
+    def test_emoji_are_counted_as_two_utf16_units(self):
+        text = "🚀" * (MAX_MESSAGE_LEN + 1)
+        chunks = split_message(text)
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual("".join(chunks), text)
+        self.assertTrue(all(len(c.encode("utf-16-le")) // 2 <= MAX_MESSAGE_LEN for c in chunks))
+
 
 class _FakeResponse(io.BytesIO):
     def __enter__(self):
@@ -84,19 +91,25 @@ class TelegramClientTests(unittest.TestCase):
 
     def test_send_message_splits_long_text(self):
         long_text = "a\n" * 5000
-        op = _FakeOpener([_ok({}) for _ in range(10)])
+        op = _FakeOpener([_ok({"message_id": i}) for i in range(1, 11)])
         client = TelegramClient("123:abc", opener=op)
-        client.send_message(42, long_text)
+        ids = client.send_message(42, long_text)
         self.assertGreater(len(op.calls), 1)
+        self.assertEqual(ids, list(range(1, len(op.calls) + 1)))
 
     def test_send_message_falls_back_to_plain_on_markdown_error(self):
         md_fail = {"ok": False, "description": "can't parse entities"}
-        op = _FakeOpener([md_fail, _ok({})])
+        op = _FakeOpener([md_fail, _ok({"message_id": 7})])
         client = TelegramClient("123:abc", opener=op)
         client.send_message(42, "*broken", parse_mode="Markdown")
         # Second call must omit parse_mode.
         self.assertEqual(len(op.calls), 2)
         self.assertNotIn(b"parse_mode", op.calls[1].data)
+
+    def test_send_message_requires_confirmation_id(self):
+        client = TelegramClient("123:abc", opener=_FakeOpener([_ok({})]))
+        with self.assertRaises(Exception):
+            client.send_message(42, "hello")
 
 
 if __name__ == "__main__":

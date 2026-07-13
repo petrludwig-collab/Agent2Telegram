@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent2telegram"
-version = "1.1.0"
+version = "1.2.0"
 description = "Connect a coding agent (Claude Code or Codex) to Telegram."
 readme = "README.md"
 requires-python = ">=3.10"
