@@ -101,8 +101,12 @@ class TmuxSession:
         text = " ".join(text.splitlines())                 # one Enter submits everything
         if self._origin:
             text = f"{self._origin}{text}"
-        _tmux("send-keys", "-t", self.name, "C-u"); time.sleep(0.05)
-        _tmux("send-keys", "-t", self.name, "-l", "--", text); time.sleep(0.15)
+        # Pauzy schválně velkorysé. S 0.05/0.15 s se na tomhle stroji Enter ztrácel:
+        # text se do promptu vložil, ale neodeslal a zpráva tam visela, dokud ji někdo
+        # ručně nepotvrdil. Zvenčí to vypadalo, že se most „nesynchronizuje".
+        # Ověřeno 2026-08-06 na sezení analytik: 0.05/0.15 selhalo opakovaně, 0.4/0.8 prošlo.
+        _tmux("send-keys", "-t", self.name, "C-u"); time.sleep(0.4)
+        _tmux("send-keys", "-t", self.name, "-l", "--", text); time.sleep(0.8)
         _tmux("send-keys", "-t", self.name, "Enter")
 
     def _capture(self) -> str:
