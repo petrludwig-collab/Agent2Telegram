@@ -18,6 +18,7 @@ import glob
 import html
 import json
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -166,6 +167,12 @@ class AttachBridge:
         files: list[str] = []
         for pat in (patterns or ("*.jsonl",)):
             files = glob.glob(str(base / "**" / pat), recursive=True)
+            # Claude Code píše záznamy subagentů do <konverzace>/subagents/. Ty sem nepatří:
+            # subagent (architect, tester, reviewer) zapisuje mnohem častěji než hlavní
+            # konverzace, takže by vyhrál na mtime a most by se přepnul na něj — a shrnutí,
+            # které agent napíše uživateli, by neodešlo nikam. Přesně tímhle přestalo chodit
+            # echo o dokončené práci (2026-08-11).
+            files = [f for f in files if f"{os.sep}subagents{os.sep}" not in f]
             if files:
                 break
         if not files:
