@@ -82,6 +82,22 @@ def _text_of(content) -> str:
     return ""
 
 
+def _codex_message_text(content, block_type: str) -> str:
+    """Extract text from selected blocks of a current Codex ``message`` response item.
+
+    Codex 0.147 records both user prompts and assistant replies as
+    ``response_item/message`` records whose text lives in ``payload.content``
+    blocks, rather than the legacy ``event_msg`` records.
+    """
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        block.get("text", "") for block in content
+        if isinstance(block, dict) and block.get("type") == block_type
+        and isinstance(block.get("text"), str)
+    ).strip()
+
+
 class ClaudeCodeReader:
     """Claude Code transcript (one JSONL record per message; assistant records carry text and
     tool_use blocks; user records may be real messages or tool results). No turn boundaries in
@@ -164,6 +180,9 @@ class CodexReader:
         p = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
         if rec.get("type") == "event_msg" and p.get("type") == "user_message":
             return p.get("message", "")
+        if (rec.get("type") == "response_item" and p.get("type") == "message"
+                and p.get("role") == "user"):
+            return _codex_message_text(p.get("content"), "input_text")
         return None
 
     def parse(self, rec: dict):
@@ -176,11 +195,21 @@ class CodexReader:
             msg = p.get("message", "")
             if msg.strip():
                 yield Ev("user", text=msg)
+        elif t == "response_item" and pt == "message" and p.get("role") == "user":
+            msg = _codex_message_text(p.get("content"), "input_text")
+            if msg:
+                yield Ev("user", text=msg)
         elif t == "event_msg" and pt == "agent_message":
             msg = (p.get("message") or "").strip()
             if msg:
                 ts = rec.get("timestamp", "")
                 yield Ev("text", text=msg, key=f"{ts}:{_hash(msg)}",
+                         final=(p.get("phase") == "final_answer"))
+        elif t == "response_item" and pt == "message" and p.get("role") == "assistant":
+            msg = _codex_message_text(p.get("content"), "output_text")
+            if msg:
+                key = p.get("id") or _hash(msg)
+                yield Ev("text", text=msg, key=key,
                          final=(p.get("phase") == "final_answer"))
         elif t == "response_item" and pt in ("function_call", "custom_tool_call", "web_search_call"):
             if pt == "web_search_call":
