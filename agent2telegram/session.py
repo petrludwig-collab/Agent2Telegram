@@ -44,6 +44,9 @@ MAX_TMUX_INJECTION_CHARS = 8000
 # paste detection swallowed the first pty read. A bracketed paste arrives whole; so does chunked typing,
 # but the paste is one atomic operation and keeps the TUI's own "[Pasted text]" handling.
 PASTE_MIN_BYTES = 600
+ENTER_VERIFY_INTERVAL = 0.2
+ENTER_RETRY_TIMEOUT = 2.0
+_INPUT_PROMPT_RE = re.compile(r"^\s*[❯›>] ?(.*)$")
 _SHELL_COMMANDS = {
     "ash", "bash", "csh", "dash", "fish", "ksh", "mksh", "pwsh", "sh", "tcsh", "zsh",
 }
@@ -83,6 +86,33 @@ def sanitize_for_tmux(text: str) -> str:
         if len(out) >= MAX_TMUX_INJECTION_CHARS:
             break
     return "".join(out)
+
+
+def _input_contains_tail(pane: str, text: str) -> bool:
+    """Match only the last input prompt, ignoring whitespace and hard wrapping.
+
+    A submitted message can remain visible in the conversation above an empty
+    prompt. Searching the entire pane would submit it a second time.
+    """
+    tail = "".join(text.split())[-24:]
+    if not tail:
+        return False
+    lines = pane.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        match = _INPUT_PROMPT_RE.match(lines[index])
+        if match:
+            block = [match.group(1)]
+            for line in lines[index + 1:]:
+                if _SEP_RE.match(line) or line.lstrip().startswith("? for "):
+                    break
+                if not line.strip():
+                    continue
+                if (_STATUS_RE.match(line.lstrip()) or _BULLET_RE.match(line)
+                        or not line[:1].isspace()):
+                    return False
+                block.append(line)
+            return tail in "".join("".join(block).split())
+    return False
 
 
 def _command_name(command: str) -> str:
@@ -241,6 +271,7 @@ class TmuxSession:
                  timeout: int = 600, idle: float = 1.5, settle: float = 0.4,
                  origin_prefix: str = "", signal_file: Path | None = None,
                  boot_wait: float = 2.0,
+                 enter_verify_timeout: float = 8.0,
                  expected_agent_commands: list[str] | tuple[str, ...] | None = None) -> None:
         if shutil.which("tmux") is None:
             raise SessionError("tmux is not installed. Install it first: `sudo apt install tmux` (Debian/Ubuntu) or `brew install tmux` (macOS) — "
@@ -251,6 +282,7 @@ class TmuxSession:
         self._settle = settle
         self._origin = origin_prefix
         self._signal = signal_file
+        self._enter_verify_timeout = enter_verify_timeout
         self._expected_agent_commands = tuple(expected_agent_commands or (agent_argv[:1] if agent_argv else ()))
         cwd.mkdir(parents=True, exist_ok=True)
         if not self._exists():
@@ -295,6 +327,42 @@ class TmuxSession:
         else:
             _tmux("send-keys", "-t", self.name, "-l", "--", text); time.sleep(0.15)
         _tmux("send-keys", "-t", self.name, "Enter")
+        self._verify_submission(text)
+
+    def _wait_for_submission(self, text: str, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        # Let the TUI render before the first capture. This runs in the same
+        # inbound worker as send-keys, leaving polling and outbound work free.
+        time.sleep(min(ENTER_VERIFY_INTERVAL, timeout / 2))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            pane = _tmux("capture-pane", "-p", "-t", self.name,
+                         timeout=min(1.0, remaining)).stdout
+            if not _input_contains_tail(pane, text):
+                return True
+            # Do not start a new capture after the deadline: an artificial tiny
+            # subprocess timeout there would hide the stuck input instead of retrying.
+            time.sleep(min(ENTER_VERIFY_INTERVAL, max(0.0, deadline - time.monotonic())))
+
+    def _verify_submission(self, text: str) -> None:
+        try:
+            if self._wait_for_submission(text, getattr(self, "_enter_verify_timeout", 8.0)):
+                return
+            # The agent may have exited during the wait. Never send Enter to a shell.
+            ok, _detail = self._pane_ok()
+            if not ok:
+                log.error("enter_not_submitted session=%s reason=unsafe_pane", self.name)
+                return
+            _tmux("send-keys", "-t", self.name, "Enter")
+            log.warning("enter_resend session=%s", self.name)
+            if not self._wait_for_submission(text, ENTER_RETRY_TIMEOUT):
+                log.error("enter_not_submitted session=%s", self.name)
+        except Exception as error:
+            # Verification must not trigger a full reinjection or reset turn tracking.
+            # Exception text can contain message content, so log only its type.
+            log.error("enter_not_submitted session=%s error=%s", self.name, type(error).__name__)
 
     def _paste(self, text: str) -> None:
         """Deliver *text* as one bracketed paste (ESC[200~ … ESC[201~) through a private tmux buffer.

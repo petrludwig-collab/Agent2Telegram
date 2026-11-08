@@ -91,6 +91,7 @@ class SenderLabelTests(unittest.TestCase):
         session._pane_ok=Mock(return_value=(True,''))
         self.b._handle(self.incoming())
         with patch('agent2telegram.session._tmux') as tmux, patch('agent2telegram.session.time.sleep'):
+            tmux.return_value.stdout = ''
             session._send_keys(self.b._inject.call_args.args[0])
         tmux.assert_any_call('send-keys','-t','fixture','-l','--','[TG] [From: Alex · DM] Hello')
 

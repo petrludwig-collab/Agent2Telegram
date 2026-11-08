@@ -48,6 +48,7 @@ class TmuxSessionSendKeysTests(unittest.TestCase):
 
     def test_send_keys_passes_sanitized_literal_argument_to_tmux(self):
         with patch.object(session, "_tmux") as tmux, patch.object(session.time, "sleep"):
+            tmux.return_value = self._cp(())
             s = object.__new__(TmuxSession)
             s.name = "a2t-test"
             s._origin = "from tg: "
@@ -61,6 +62,7 @@ class TmuxSessionSendKeysTests(unittest.TestCase):
 
     def test_send_keys_collapses_newlines_to_one_literal_submit(self):
         with patch.object(session, "_tmux") as tmux, patch.object(session.time, "sleep"):
+            tmux.return_value = self._cp(())
             s = self._bare(())
             s._send_keys("first line\nsecond line\r\nthird\tline")
 
@@ -251,9 +253,9 @@ class LongMessagePasteTests(unittest.TestCase):
         body = "Text with Unicode λ, commas and full stops. " * 40          # ≈ 1.7 KB, like the real case
         calls, loaded = self._run(body + "\nfinal line")
         names = [c[0] for c in calls]
-        self.assertEqual(names, ["send-keys", "load-buffer", "paste-buffer", "send-keys"])
+        self.assertEqual(names, ["send-keys", "load-buffer", "paste-buffer", "send-keys", "capture-pane"])
         self.assertEqual(calls[0][1:], ("-t", "a2t-test", "C-u"))
-        self.assertEqual(calls[-1][1:], ("-t", "a2t-test", "Enter"))
+        self.assertEqual(calls[-2][1:], ("-t", "a2t-test", "Enter"))
         self.assertIn("-p", calls[2])                                     # bracketed paste
         self.assertIn("-d", calls[2])                                     # buffer deleted after use
         self.assertEqual(calls[1][2], calls[2][calls[2].index("-b") + 1])  # same buffer name
@@ -264,7 +266,7 @@ class LongMessagePasteTests(unittest.TestCase):
     def test_short_text_keeps_the_literal_send_keys_path(self):
         calls, loaded = self._run("✅ short message")
         names = [c[0] for c in calls]
-        self.assertEqual(names, ["send-keys", "send-keys", "send-keys"])
+        self.assertEqual(names, ["send-keys", "send-keys", "send-keys", "capture-pane"])
         self.assertEqual(calls[1][1:], ("-t", "a2t-test", "-l", "--", "[TG] ✅ short message"))
         self.assertEqual(loaded, {})
 

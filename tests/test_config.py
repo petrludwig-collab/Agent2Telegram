@@ -70,6 +70,20 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             Config(agent="codex", token="1:2", allowed_user_ids=[1], mode="webhook").validate()
 
+    def test_enter_verify_timeout_defaults_and_roundtrips(self):
+        cfg = Config(agent="codex", token="1:2", allowed_user_ids=[1])
+        self.assertEqual(cfg.enter_verify_timeout, 8.0)
+        cfg.enter_verify_timeout = 0.25
+        save(cfg, self.path)
+        self.assertEqual(load(self.path).enter_verify_timeout, 0.25)
+
+    def test_enter_verify_timeout_rejects_invalid_or_unbounded_values(self):
+        for value in (True, False, 0, -1, "8", None, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                cfg = Config(agent="codex", token="1:2", enter_verify_timeout=value)
+                with self.assertRaises(ConfigError):
+                    cfg.validate()
+
     def test_redacted_masks_token(self):
         cfg = Config(agent="codex", token="123456:supersecret", allowed_user_ids=[1])
         self.assertNotIn("supersecret", str(cfg.redacted()))

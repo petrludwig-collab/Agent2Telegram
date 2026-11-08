@@ -294,6 +294,7 @@ class AttachBridge:
         expected_agent_commands = _expected_agent_commands(cfg)
         self._session = TmuxSession([], name=cfg.tmux_session, cwd=Path.home(),
                                     origin_prefix=cfg.origin_prefix, boot_wait=0,
+                                    enter_verify_timeout=cfg.enter_verify_timeout,
                                     expected_agent_commands=expected_agent_commands)
         self._stop = threading.Event()
         self._init_inbound_worker_state()

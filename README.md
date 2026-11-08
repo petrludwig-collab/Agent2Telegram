@@ -324,6 +324,14 @@ unclassified text stays private and a missing answer is logged; configure a work
 Stop hook for Claude. Background jobs should use `notify --to-group` to address a group
 explicitly instead of relying on the previous turn's destination.
 
+After injecting a message, attach mode checks the last visible input prompt every 0.2 seconds.
+If the message tail remains there for `"enter_verify_timeout": 8.0` seconds, the bridge checks
+that the agent is still running, sends Enter once more, and logs `enter_resend session=...`.
+If the input is still stuck after another 2 seconds, or verification fails, it logs
+`enter_not_submitted session=...` and preserves turn tracking. The timeout must be a positive
+finite number. This screen heuristic supports Claude Code and Codex prompt markers; hidden
+paste previews and changed TUI layouts can prevent detection. It does not prove transcript receipt.
+
 In attach mode, optional `"inbound_sender_label": true` adds sender/chat context immediately
 after `origin_prefix`: `[From: Alex · DM]` or `[From: Alex · group "Team"]`.
 The default language is English. With explicit `language: "cs"`, the original Czech
