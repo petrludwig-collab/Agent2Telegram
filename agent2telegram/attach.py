@@ -48,6 +48,15 @@ from .telegram import TelegramClient, TelegramError, is_network_error, split_mes
 
 log = logging.getLogger("agent2telegram.attach")
 
+
+class InboundDeferred(Exception):
+    """Delivery has not started; retry without consuming the failure budget.
+
+    Raise only before injection or other non-idempotent work. An uncertain write
+    to the session must never be classified as a safe deferral.
+    """
+
+
 #: Fallback only: how long the transcript may be quiet before we force-end a turn, in case
 #: the Stop-hook turn-end marker never arrives. The marker is the primary, precise signal —
 #: this just stops "typing…" from hanging forever if the hook is missing/misconfigured.
@@ -709,7 +718,11 @@ class AttachBridge:
         inbox = getattr(self, "_inbox", None)
         if inbox is None:
             try:
-                inbox = DurableInbox(self._offset_file.parent)
+                # An accepted update can wait behind a live turn indefinitely.
+                # Capacity and real delivery failures bound the queue; age alone
+                # must not turn a waiting message into a permanent failure.
+                inbox = DurableInbox(self._offset_file.parent,
+                                     pending_retention_seconds=float("inf"))
             except Exception as e:                     # must not break message intake
                 log.error("could not open the durable inbox: %s", e)
                 inbox = None
@@ -1177,22 +1190,37 @@ class AttachBridge:
             except queue.Empty:
                 continue
             upd, record_id = item if isinstance(item, tuple) else (item, None)
+            settled = False
             try:
-                delivered = self._handle(upd)
-            except Exception as e:
-                log.error("inbound worker error: error=%s id=%s %s",
-                          type(e).__name__, record_id, update_metadata(upd))
-                self._inbound_failed(record_id, str(e))
-            else:
-                # `_handle` returns False when the message never reached the session. Both cases
-                # used to just call task_done and the message vanished — that is audit finding B.
-                if delivered is not False:
-                    log.info("IN  delivered to session id=%s", record_id)
-                if delivered is False:
-                    self._inbound_failed(record_id, "not delivered to the session")
-                else:
-                    self._inbound_done(record_id)
+                delay = 1.0
+                while not self._stop.is_set():
+                    try:
+                        delivered = self._handle(upd)
+                    except InboundDeferred:
+                        # Keep FIFO ownership and the original durable record. A busy
+                        # destination has not attempted delivery and cannot exhaust retries.
+                        log.info("IN  delivery deferred id=%s retry_in=%.1fs", record_id, delay)
+                        self._stop.wait(delay)
+                        delay = min(delay * 2, 30.0)
+                        continue
+                    except Exception as e:
+                        log.error("inbound worker error: error=%s id=%s %s",
+                                  type(e).__name__, record_id, update_metadata(upd))
+                        self._inbound_failed(record_id, str(e))
+                    else:
+                        if delivered is False:
+                            if self._stop.is_set():
+                                break  # Shutdown while waiting: replay the unchanged record.
+                            self._inbound_failed(record_id, "not delivered to the session")
+                        else:
+                            log.info("IN  delivered to session id=%s", record_id)
+                            self._inbound_done(record_id)
+                    settled = True
+                    break
             finally:
+                if not settled:
+                    with self._inbound_worker_lock:
+                        self._inbound_inflight().discard(record_id)
                 self._inbound_queue.task_done()
 
     def _inbound_done(self, record_id: str | None) -> None:
@@ -1285,7 +1313,8 @@ class AttachBridge:
         The return value drives the durable inbox: True = handled, the record may go; False = not
         delivered, the record stays and is retried. So every "nothing to do" branch returns True —
         retrying them is pointless. False comes solely from a failed write to tmux, exactly what
-        retrying cures.
+        retrying cures. Adapters may raise InboundDeferred before delivery starts to wait without
+        consuming the failure budget.
         """
         # Reactions (e.g. ❤️) → quick-feedback line.
         mr = upd.get("message_reaction")

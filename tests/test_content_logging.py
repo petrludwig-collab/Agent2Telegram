@@ -198,8 +198,11 @@ class ContentLoggingTests(unittest.TestCase):
             b = _bridge(self.root)
             b._ensure_inbound_worker_state()
             b._inbound_queue.put((_msg(99, text), None))
-            b._handle = Mock(side_effect=RuntimeError(text))
-            b._stop.set()
+            def fail(_):
+                b._stop.set()
+                raise RuntimeError(text)
+
+            b._handle = Mock(side_effect=fail)
             b._inbound_worker_loop()
         else:
             b = bridge.Bridge(attach.Config(agent="generic", token="1:fixture", workdir=str(self.root),
