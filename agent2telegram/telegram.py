@@ -116,6 +116,40 @@ def split_message(text: str, limit: int = MAX_MESSAGE_LEN) -> list[str]:
     return [c for c in chunks if c]
 
 
+def _probe_video(path: str) -> dict:
+    """Display width, height and duration of a video via ffprobe ({} when unavailable).
+    Rotation metadata is honoured, so a portrait phone clip is reported as portrait."""
+    import shutil
+    import subprocess
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return {}
+    try:
+        r = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                            "stream=width,height,sample_aspect_ratio:stream_side_data=rotation:"
+                            "format=duration", "-of", "json", path],
+                           capture_output=True, text=True, timeout=30)
+        info = json.loads(r.stdout or "{}")
+        st = (info.get("streams") or [{}])[0]
+        w, h = int(st["width"]), int(st["height"])
+        sar = st.get("sample_aspect_ratio") or "1:1"
+        if ":" in sar and sar not in ("0:1", "1:1"):
+            num, den = (int(x) for x in sar.split(":"))
+            if num and den:
+                w = round(w * num / den)
+        rot = next((abs(int(sd.get("rotation", 0))) for sd in st.get("side_data_list", [])
+                    if "rotation" in sd), 0)
+        if rot in (90, 270):
+            w, h = h, w
+        out = {"width": str(w), "height": str(h)}
+        dur = (info.get("format") or {}).get("duration")
+        if dur:
+            out["duration"] = str(int(round(float(dur))))
+        return out
+    except Exception:  # noqa: BLE001 – best effort; sending without dimensions still works
+        return {}
+
+
 class TelegramError(Exception):
     def __init__(self, message: str, *, network_error: bool = False):
         super().__init__(message)
@@ -370,6 +404,10 @@ class TelegramClient:
             fields["caption"] = caption[:1024]
         if method == "sendVideo":
             fields["supports_streaming"] = "true"
+            if not (meta or {}).get("width"):
+                # Without explicit dimensions Telegram guesses the aspect ratio and often
+                # shows a 16:9 video squashed or square. Probe the file and send them.
+                meta = {**_probe_video(path), **(meta or {})}
         for k, v in (meta or {}).items():          # width/height/duration/title/performer
             fields[k] = v
         with open(path, "rb") as fh:
