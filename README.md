@@ -243,10 +243,21 @@ those, push a message to yourself with:
 python3 -m agent2telegram notify "build finished ✅"
 echo "deploy done" | python3 -m agent2telegram notify          # or pipe it on stdin
 python3 -m agent2telegram notify --config ~/.config/agent2telegram/codex-config.json "…"
+python3 -m agent2telegram notify "build finished ✅" --to-group  # exactly one allowed group
+python3 -m agent2telegram notify "report ready" --to-group -1001234567890 \
+  --file ~/.local/state/agent2telegram/outbox/report.pdf
 ```
 
 It sends to the configured owner via the bot (Markdown rendered, same as chat replies). Handy
 in a `cron` line or at the end of a script so the agent tells you when something finishes.
+
+`--to-group [GROUP_ID]` explicitly selects a group from the chosen config's
+`allowed_group_ids`. Without an ID, exactly one allowed group must be configured.
+With multiple groups, pass the ID. Missing or unauthorized groups are refused before
+any network request; the command never falls back to the owner's DM. Put the message
+before a bare `--to-group`, or pipe it on stdin, so it cannot be mistaken for an ID.
+`--file` is repeatable and enforces the same outbox allowlist as chat attachments.
+Notification routing logs contain the destination ID, without the message text.
 
 ---
 
@@ -297,6 +308,22 @@ accepts only @mentions, commands addressed to that bot, and replies to its messa
 Other group messages are silently ignored, including receipt acknowledgments. Private chats
 are unchanged. The default is `false`; the authorized-user allowlist is always enforced.
 
+In attach mode, `"reply_to_origin_chat": true` sends the answer back to the authorized
+message's chat. Set `allowed_group_ids` to the groups that may use the bridge.
+`"group_interim": false` is the safe default, including for existing configurations:
+group destinations receive the turn's final answer and allowed attachments (`[tg-file]`
+or the agent's file-sending tool). Narration, tool/status bubbles, background progress,
+typing indicators and queued-message acknowledgments are suppressed in groups.
+Private chats keep their existing live progress. Explicitly set `"group_interim": true`
+to restore live progress in groups. The policy also covers replies routed by `group_marker`.
+
+Group text is held until Codex reports turn completion, the Claude Stop hook fires, or
+a final-answer signal arrives. Explicit commentary and text followed by a tool call
+cannot become a final answer through the backstop. If only inactivity ends a turn,
+unclassified text stays private and a missing answer is logged; configure a working
+Stop hook for Claude. Background jobs should use `notify --to-group` to address a group
+explicitly instead of relying on the previous turn's destination.
+
 In attach mode, optional `"inbound_sender_label": true` adds sender/chat context immediately
 after `origin_prefix`: `[From: Alex · DM]` or `[From: Alex · group "Team"]`.
 The default language is English. With explicit `language: "cs"`, the original Czech
@@ -305,7 +332,8 @@ Names come from the current Telegram sender, including voice messages, attachmen
 reply quotes do not replace the sender. Display names (64 characters) and group titles (80)
 are sanitized to one line without brackets, quotes or control characters.
 These user-controlled descriptions are not proof of identity or approval: authorization still
-uses Telegram user IDs. Routing is unchanged, and `notify` still targets the owner's DM.
+uses Telegram user IDs. Routing is unchanged, and `notify` defaults to the owner's DM;
+`--to-group` explicitly selects an allowed group.
 The default is `false`, preserving existing prompts.
 
 Operational notices: `"language": "cs"` translates the busy acknowledgment and the default

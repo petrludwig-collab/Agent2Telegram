@@ -38,6 +38,7 @@ class Ev:
     key: str = ""           # stable dedup id (text uuid/hash, tool call id)
     final: bool = False      # for 'text': hint that this is the final answer
     files: tuple = ()        # for 'files': paths the agent wants delivered to the user
+    interim: bool = False    # explicit narration; must never be promoted to a group final answer
 
 
 def _short(s: str, n: int = 58) -> str:
@@ -167,7 +168,9 @@ class ClaudeCodeReader:
         text = "\n".join(b.get("text", "") for b in blocks
                          if isinstance(b, dict) and b.get("type") == "text").strip()
         if text:
-            yield Ev("text", text=text, key=rec.get("uuid", "") or _hash(text))
+            stop = rec.get("message", {}).get("stop_reason")
+            yield Ev("text", text=text, key=rec.get("uuid", "") or _hash(text),
+                     final=stop == "end_turn", interim=stop == "tool_use")
         for b in blocks:
             if isinstance(b, dict) and b.get("type") == "tool_use":
                 tid = b.get("id")
@@ -282,7 +285,8 @@ class CodexReader:
                 ts = rec.get("timestamp", "")
                 self._recent_msgs.append(_hash(msg))
                 yield Ev("text", text=msg, key=f"{ts}:{_hash(msg)}",
-                         final=(p.get("phase") == "final_answer"))
+                         final=(p.get("phase") == "final_answer"),
+                         interim=(p.get("phase") == "commentary"))
         elif t == "response_item" and pt == "message" and p.get("role") == "assistant":
             # Fallback for Codex >= 0.149, which no longer emits event_msg/agent_message.
             msg = _codex_message_text(p, "output_text")
@@ -290,7 +294,8 @@ class CodexReader:
                 ts = rec.get("timestamp", "")
                 self._recent_msgs.append(_hash(msg))
                 yield Ev("text", text=msg, key=f"{ts}:{_hash(msg)}",
-                         final=(p.get("phase") == "final_answer" or p.get("phase") is None))
+                         final=(p.get("phase") == "final_answer" or p.get("phase") is None),
+                         interim=(p.get("phase") == "commentary"))
         elif t == "response_item" and pt in ("function_call", "custom_tool_call", "web_search_call"):
             if pt == "web_search_call":
                 action = p.get("action") if isinstance(p.get("action"), dict) else {}

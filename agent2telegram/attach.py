@@ -242,6 +242,9 @@ def _in_test_run() -> bool:
 
 class AttachBridge:
     _turn_end_backstop_enabled = True
+    _group_reply = None          # last group-bound text, held until the turn ends
+    _group_files = ()            # native file-tool attachments held for the same turn
+    _group_end_confirmed = False
     # Background progress state. Class-level defaults so objects built without __init__
     # (focused tests) behave as "feature off, nothing shown".
     _bg_status = False          # the status bubble belongs to a turn NOT started from Telegram
@@ -832,6 +835,10 @@ class AttachBridge:
         return next_offset
 
     # ---- durable outbound delivery (never drop a reply) --------------------
+    def _interim_allowed(self, chat: int | None) -> bool:
+        """Telegram group/supergroup ids are negative. Apply policy to the actual destination."""
+        return chat is None or chat >= 0 or getattr(self.cfg, "group_interim", False) is True
+
     def _load_queue(self) -> list:
         if self._queue_path is None or not self._queue_path.exists():
             return []
@@ -926,6 +933,9 @@ class AttachBridge:
             text, files = self._extract_files(text)
             if files:
                 self._pending_files = getattr(self, "_pending_files", []) + files
+                if not self._interim_allowed(target):
+                    # Recovery can re-read markers already collected while withholding narration.
+                    self._pending_files = list(dict.fromkeys(self._pending_files))
             if not text and self._ensure_outbox() is None:
                 # Only without the durable queue do we take the old path. EVERY attachment-only
                 # reply used to slip through here: _flush_files clears the path from memory before
@@ -1428,8 +1438,9 @@ class AttachBridge:
                           chat_id, CHAT_SWITCH_MAX_WAIT)
                 try:
                     from .notices import waiting_for_turn_end_text
-                    self.tg.send_message(chat_id, busy_text(self.cfg) if self._busy_for_notice()
-                                         else waiting_for_turn_end_text(self.cfg))
+                    if self._interim_allowed(chat_id):
+                        self.tg.send_message(chat_id, busy_text(self.cfg) if self._busy_for_notice()
+                                             else waiting_for_turn_end_text(self.cfg))
                 except Exception as e:
                     log.warning("could not report the long wait: %s", e)
             time.sleep(CHAT_SWITCH_POLL)
@@ -1467,6 +1478,8 @@ class AttachBridge:
             return
         chat_id = (msg.get("chat") or {}).get("id")
         if chat_id is None:
+            return
+        if not self._interim_allowed(chat_id):
             return
         now = time.monotonic()
         # MIND the default: `time.monotonic()` counts from SYSTEM start, so on a long-running
@@ -1507,10 +1520,13 @@ class AttachBridge:
         self._last_activity = now
         self._turn_started = now
         self._turn_started_wall = time.time()   # records are stamped with wall-clock time
-        self._typing_count = 1
+        self._typing_count = 0
         self._max_gap = 0.0
         self._last_typing = now
         self._turn_text_sent = False             # gate TUI bubbles until intro text lands
+        self._group_reply = None
+        self._group_files = ()
+        self._group_end_confirmed = False
         self._turn_is_reaction = False           # set by the reaction branch right after this
         # Where the transcript stood when this turn began. The backstop scans only from here:
         # anything before it belongs to an earlier turn and must never be re-sent as this turn's
@@ -1533,7 +1549,9 @@ class AttachBridge:
                 self._tui_seen = set()
         else:
             self._tui_seen = set()
-        self.tg.send_chat_action(self._owner_chat, "typing")   # instant, don't wait for the loop
+        if self._interim_allowed(self._owner_chat):
+            self.tg.send_chat_action(self._owner_chat, "typing")   # instant, don't wait for the loop
+            self._typing_count = 1
         log.info("TURN START t=%.2f", time.time())
 
     def _inject(self, text: str) -> bool:
@@ -1782,7 +1800,8 @@ class AttachBridge:
         cause of mid-turn typing gaps. It stops the instant the turn ends (turn_active cleared), so
         no action fires after the final message and typing stops with it (bar Telegram's ~5s decay)."""
         while not self._stop.is_set():
-            if self._busy_for_notice() and self._turn_from_tg and self._owner_chat is not None:
+            if (self._busy_for_notice() and self._turn_from_tg and self._owner_chat is not None
+                    and self._interim_allowed(self._owner_chat)):
                 now = time.monotonic()
                 gap = now - self._last_typing
                 if gap > self._max_gap:
@@ -1796,7 +1815,8 @@ class AttachBridge:
         """Codex only: scrape the tmux pane for live tool/web-search lines → status bubbles, so
         Codex (whose rollout logs tools only at completion) shows them live like Claude Code."""
         while not self._stop.is_set():
-            if self._turn_active.is_set() and self._turn_from_tg and self._owner_chat is not None:
+            if (self._turn_active.is_set() and self._turn_from_tg and self._owner_chat is not None
+                    and self._interim_allowed(self._owner_chat)):
                 # Hold bubbles until the intro text is forwarded (so the bubble doesn't jump ahead
                 # of "I'll search the web…"), then release; after a short grace show them anyway.
                 ready = self._turn_text_sent or \
@@ -1839,6 +1859,12 @@ class AttachBridge:
         last = None
         last_key = None                              # transcript with no assistant text at all
         sent = getattr(self, "_sent_keys", set())
+        group = not self._interim_allowed(self._owner_chat)
+        last_group = group
+        # A fresh reader must see texts withheld by the live reader, including Codex's
+        # duplicate-record window. Never alter the live reader's state during a tail scan.
+        reader = (readers.for_agent(self.cfg.agent) if group or getattr(self.cfg, "group_marker", "")
+                  else getattr(self, "_reader", None) or readers.for_agent(self.cfg.agent))
         for raw in tail.split(b"\n"):
             line = raw.strip()
             if not line:
@@ -1848,8 +1874,16 @@ class AttachBridge:
             except (ValueError, json.JSONDecodeError):
                 continue
             try:
-                for ev in self._reader.parse(rec):
+                for ev in reader.parse(rec):
+                    if last_group and ev.kind in ("tool", "files", "user", "turn_start"):
+                        last, last_key = None, None
                     if ev.kind == "text" and ev.text and ev.text.strip():
+                        _, target = self._route_group_marker(self._strip_marker(ev.text))
+                        last_group = not self._interim_allowed(target)
+                        if last_group:
+                            last, last_key = None, None
+                            if ev.interim or not (ev.final or self._group_end_confirmed):
+                                continue
                         if ev.key and ev.key in sent:
                             continue                 # already delivered → not this turn's answer
                         last = ev.text
@@ -1901,13 +1935,23 @@ class AttachBridge:
         return (getattr(self, "_transcript", None) is not None
                 or getattr(self, "_signal", None) is not None)
 
-    def _finish_turn(self) -> None:
+    def _finish_turn(self, *, confirmed: bool = True) -> None:
         """Drop the technical bubble and stop the typing indicator at the real end of a turn."""
         self._status_clear()
         was_active = self._turn_active.is_set()
         from_tg_at_end = self._turn_from_tg
         text_sent_at_end = self._turn_text_sent
         reaction_at_end = getattr(self, "_turn_is_reaction", False)
+        self._group_end_confirmed = confirmed
+        reply = self._group_reply
+        self._group_reply = None
+        if was_active and self._turn_from_tg and self._group_files:
+            self._pending_files = list(getattr(self, "_pending_files", []) or []) + list(self._group_files)
+        self._group_files = ()
+        if was_active and self._turn_from_tg and reply is not None:
+            text, key, final = reply
+            if final or confirmed:
+                self._send_final(text, key=key)
         # Backstop: a Telegram-originated turn must NEVER go unanswered. If nothing was forwarded
         # this turn (the [tg] marker was forgotten, the turn was a long heads-down working stretch,
         # or interim forwarding missed it), deliver the final assistant message now. The
@@ -1926,7 +1970,7 @@ class AttachBridge:
                     source = "signal"
                     answer = self._consume_signal_text()
                     out = self._strip_marker(answer) if answer else ""
-            if out and not self._turn_text_sent:
+            if (out or getattr(self, "_pending_files", None)) and not self._turn_text_sent:
                 # Send WITH the message's dedup key. Without it the backstop and the normal
                 # transcript path both queue the same text under different ids and the user
                 # gets it twice — proven from the log on 2026-08-02 (ids 433fa145 / 52df94c3,
@@ -1956,6 +2000,7 @@ class AttachBridge:
             # lost reply would look exactly the same in the daily traffic analysis.
             log.info("TURN END reaction turn without a reply (backstop deliberately skipped)")
         self._turn_active.clear()
+        self._group_end_confirmed = False
         self._pending_turn_end = False
         self._consume_turn_end()
         if was_active:
@@ -1968,10 +2013,13 @@ class AttachBridge:
                      self._typing_count, self._max_gap, from_tg_at_end, text_sent_at_end,
                      reaction_at_end)
 
-    def _end_turn(self) -> None:
+    def _end_turn(self, *, confirmed: bool = True) -> None:
         # Claude Stop-hook path: catch anything written just before the hook fired, then finish.
         self._drain_transcript()
-        self._finish_turn()
+        if confirmed:
+            self._finish_turn()
+        else:
+            self._finish_turn(confirmed=False)
 
 
     def _outbound_loop(self) -> None:
@@ -2006,7 +2054,10 @@ class AttachBridge:
                                 self._idle_limit())
                     if self.cfg.agent == 'claude-code':
                         self._claude_hook_ready = False
-                    self._end_turn()
+                    if self._interim_allowed(getattr(self, "_owner_chat", None)):
+                        self._end_turn()
+                    else:
+                        self._end_turn(confirmed=False)
                 self._expire_background_status()
                 # Live retry: messages that failed to deliver are retried while running too.
                 # Replay only at startup meant, for a long-running service, waiting forever.
@@ -2090,13 +2141,16 @@ class AttachBridge:
         """Own thread: a flood-control wait on an edit must never stall reply forwarding."""
         while not self._stop.is_set():
             try:
-                self._bg_watcher.tick()
+                if self._interim_allowed(self._bg_watcher.chat_id):
+                    self._bg_watcher.tick()
             except Exception as e:
                 log.error("background progress error: %s", e)
             self._stop.wait(BACKGROUND_TICK)
 
     # ---- live tool-call status bubble (shown during the turn, deleted at the end) ------
     def _status_push(self, line: str, *, background: bool = False) -> None:
+        if not self._interim_allowed(self._owner_chat):
+            return
         # Single line, emoji at the start, rendered in italics. One bubble is edited in place
         # across a run of consecutive tool calls; it's deleted when the next progress message
         # arrives (then re-created below it) and at turn end — so it always trails at the bottom.
@@ -2167,7 +2221,15 @@ class AttachBridge:
         answer = self._consume_signal_text()
         if not answer:
             return
+        _, target = self._route_group_marker(answer)
+        if (not self._interim_allowed(target)
+                and not (self._turn_active.is_set() and self._turn_from_tg)):
+            log.info("signal ignored outside a Telegram group turn chat=%s", self._owner_chat)
+            return
         if answer and self._owner_chat is not None:
+            self._group_reply = None
+            self._pending_files = list(getattr(self, "_pending_files", []) or []) + list(self._group_files)
+            self._group_files = ()
             self._status_clear()                         # final message → drop the technical bubble
             self._send_final(answer)                     # reliable: queue + retry on send failure
             self._turn_active.clear()
@@ -2360,6 +2422,8 @@ class AttachBridge:
             return
         if self._owner_chat is None:
             return
+        if ev.kind in ("tool", "files", "text"):
+            self._group_reply = None  # a later tool invalidates a narration-only candidate
         if ev.kind == "tool" and not self._turn_from_tg and self._rec_live:
             # Live tool call of a turn NOT started from Telegram (opt-in background progress).
             if ev.key and ev.key not in self._seen_tools:
@@ -2381,6 +2445,16 @@ class AttachBridge:
         if ev.kind == "text":
             out = self._strip_marker(ev.text)
             if out and ev.key not in self._sent_keys:
+                _, target = self._route_group_marker(out)
+                if not self._interim_allowed(target):
+                    if self._turn_active.is_set() and self._turn_from_tg:
+                        if (target == self._owner_chat and self.cfg.file_marker
+                                and self.cfg.file_marker.lower() in out.lower()):
+                            out, files = self._extract_files(out)
+                            self._group_files = tuple(dict.fromkeys(self._group_files + tuple(files)))
+                        if not ev.interim:
+                            self._group_reply = (out, ev.key, ev.final)
+                    return
                 # A new progress message → delete the current technical bubble so the next tool
                 # calls re-create it BELOW this message (the bubble always trails at the bottom).
                 self._status_clear()
@@ -2395,7 +2469,11 @@ class AttachBridge:
             if ev.key in self._seen_tools:
                 return                            # already handled (transcript re-read on resume)
             self._seen_tools.add(ev.key)
-            self._send_files(list(ev.files))
+            if not self._interim_allowed(self._owner_chat):
+                if self._turn_active.is_set() and self._turn_from_tg:
+                    self._group_files = tuple(dict.fromkeys(self._group_files + tuple(ev.files)))
+            else:
+                self._send_files(list(ev.files))
         elif ev.kind == "tool":
             if self.cfg.agent == "codex":
                 return                            # Codex tools come live from the TUI scraper

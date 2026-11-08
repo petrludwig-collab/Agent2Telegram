@@ -15,6 +15,8 @@ import sys
 from .config import ConfigError
 from .session import SessionError
 
+_DEFAULT_GROUP = object()  # --to-group without an explicit id
+
 
 def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(
@@ -64,7 +66,7 @@ def _cmd_run(args) -> int:
 
 
 def _cmd_notify(args) -> int:
-    """Push a message to the configured owner via the bot — for PROACTIVE notifications from
+    """Push a message to the configured owner or an allowed group via the bot — for notifications from
     cron jobs, background tasks or scripts (e.g. "build finished ✅"). This is the supported way
     for the agent to reach you unprompted: the bridge only forwards replies during a Telegram-
     originated turn, so a background job can't deliver through the normal chat flow — it calls
@@ -78,22 +80,36 @@ def _cmd_notify(args) -> int:
     except ConfigError as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2
+    group = getattr(args, "to_group", None)
+    if group is not None:
+        groups = cfg.allowed_group_ids
+        if group is _DEFAULT_GROUP:
+            if len(groups) != 1:
+                print("✗ --to-group requires GROUP_ID unless exactly one group is allowed", file=sys.stderr)
+                return 2
+            group = groups[0]
+        if group not in groups:
+            print(f"✗ group {group} is not in allowed_group_ids", file=sys.stderr)
+            return 2
+        target = group
+    elif cfg.allowed_user_ids:
+        target = cfg.allowed_user_ids[0]
+    else:
+        print("✗ no owner to notify (allowed_user_ids is empty)", file=sys.stderr)
+        return 2
     files = list(getattr(args, "file", None) or [])
     text = args.message if args.message is not None else ("" if files else sys.stdin.read())
     text = (text or "").strip()
     if not text and not files:
         print("✗ nothing to send (pass a message, pipe it on stdin, or use --file)", file=sys.stderr)
         return 2
-    if not cfg.allowed_user_ids:
-        print("✗ no owner to notify (allowed_user_ids is empty)", file=sys.stderr)
-        return 2
     from .telegram import TelegramClient, TelegramError
     from pathlib import Path
     client = TelegramClient(cfg.token)
-    owner = cfg.allowed_user_ids[0]
+    logging.getLogger("agent2telegram.notify").info("notify target chat=%s", target)
     try:
         if text:
-            client.send_message(owner, text)
+            client.send_message(target, text)
             print("✓ sent")
     except TelegramError as e:
         print(f"✗ send failed: {e}", file=sys.stderr)
@@ -118,7 +134,7 @@ def _cmd_notify(args) -> int:
             rc = 1
             continue
         try:
-            client.send_file(owner, path)
+            client.send_file(target, path)
             print(f"✓ sent {path.name}")
         except TelegramError as e:
             print(f"✗ {path.name}: {e}", file=sys.stderr)
@@ -297,9 +313,11 @@ def _main(argv: list[str] | None = None) -> int:
     se.add_argument("--config", help="path to a specific bridge config")
     run_p = sub.add_parser("run", help="start the bridge")
     run_p.add_argument("--config", help="path to a specific config (run multiple bridges from one install)")
-    nt = sub.add_parser("notify", help="push a message to the owner (for cron/background jobs)")
+    nt = sub.add_parser("notify", help="push a message to the owner or an allowed group (for cron/background jobs)")
     nt.add_argument("message", nargs="?", help="text to send (omit to read from stdin)")
     nt.add_argument("--config", help="path to a specific bridge config")
+    nt.add_argument("--to-group", nargs="?", type=int, const=_DEFAULT_GROUP, metavar="GROUP_ID",
+                    help="send to an allowed group; omit GROUP_ID only when exactly one is configured")
     nt.add_argument("--file", action="append",
                     help="attach a file from an outbox folder (repeatable)")
     sub.add_parser("service", help="print a systemd/launchd service unit")

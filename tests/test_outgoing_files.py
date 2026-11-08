@@ -151,7 +151,7 @@ class NotifyFilesTest(unittest.TestCase):
             cfg = cfg_with_outbox(out)
             cfg.allowed_user_ids = [1]
             client = mock.Mock()
-            args = mock.Mock(message="hi", config=None, file=[str(secret)])
+            args = mock.Mock(message="hi", config=None, file=[str(secret)], to_group=None)
             with mock.patch("agent2telegram.config.load", return_value=cfg), \
                  mock.patch("agent2telegram.telegram.TelegramClient", return_value=client):
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -170,7 +170,7 @@ class NotifyFilesTest(unittest.TestCase):
             cfg = cfg_with_outbox(out)
             cfg.allowed_user_ids = [1]
             client = mock.Mock()
-            args = mock.Mock(message=None, config=None, file=[str(f)])
+            args = mock.Mock(message=None, config=None, file=[str(f)], to_group=None)
             with mock.patch("agent2telegram.config.load", return_value=cfg), \
                  mock.patch("agent2telegram.telegram.TelegramClient", return_value=client):
                 with contextlib.redirect_stdout(io.StringIO()):

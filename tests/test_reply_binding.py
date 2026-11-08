@@ -100,6 +100,7 @@ class ReplyBindingTests(unittest.TestCase):
         self.assertEqual(self.b._owner_chat, OWNER)
 
     def test_timeout_never_switches_while_the_old_turn_runs(self):
+        self.b.cfg.group_interim = True  # this case exercises the optional waiting notice
         self.b._turn_active.set()
         orig = (attach.CHAT_SWITCH_POLL, attach.CHAT_SWITCH_MAX_WAIT)
         attach.CHAT_SWITCH_POLL, attach.CHAT_SWITCH_MAX_WAIT = 0.01, 0.0

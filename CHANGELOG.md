@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Attach mode defaults to `group_interim: false`: group destinations receive the final
+  answer and allowed attachments, with narration, tool/status bubbles, background progress,
+  typing and queued-message acknowledgments suppressed. Private-chat progress is unchanged;
+  `group_interim: true` restores group progress. Group-marker routing follows the same policy.
+- Turn-end recovery preserves withheld final answers without promoting explicit commentary
+  or narration followed by a tool call. Inactivity alone cannot publish unclassified group text.
+- `notify --to-group [GROUP_ID]` sends text and outbox files to an explicitly allowed group.
+  The ID may be omitted when exactly one group is configured; ambiguous or unauthorized
+  destinations are refused before sending. Routing logs record the destination ID only.
+
 ## 1.2.6 – 2026-10-21
 
 - Bridges restart on macOS also when `launchctl print` cannot inspect the GUI domain (exit code 125 over SSH or in tmux). Without the launchd plist the service cannot be running the bridge, so the bridges restart directly instead of aborting.

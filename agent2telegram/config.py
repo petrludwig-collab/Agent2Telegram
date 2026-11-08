@@ -58,6 +58,7 @@ class Config:
     bot_username: str = ""              # the bot's @username (non-secret; for t.me/ deep links)
     require_mention: bool = False        # groups: only @bot mentions / replies to this bot
     reply_to_origin_chat: bool = False   # attach: answer in the chat the last authorized message came from
+    group_interim: bool = False          # attach: opt into narration, tool/status bubbles and typing in groups
     group_only_user_ids: list[int] = field(default_factory=list)   # allowed users accepted ONLY in groups
     allowed_group_ids: list[int] = field(default_factory=list)     # if set, groups other than these are ignored
     group_marker: str = ""              # reply starting with this goes to allowed_group_ids[0] (marker stripped)
@@ -103,6 +104,8 @@ class Config:
             raise ConfigError("'require_mention' must be a boolean.")
         if type(self.reply_to_origin_chat) is not bool:
             raise ConfigError("'reply_to_origin_chat' must be a boolean.")
+        if type(self.group_interim) is not bool:
+            raise ConfigError("'group_interim' must be a boolean.")
         owner = self.allowed_user_ids[0] if self.allowed_user_ids else None
         if (not isinstance(self.group_only_user_ids, list)
                 or any(type(i) is not int or i not in self.allowed_user_ids or i == owner

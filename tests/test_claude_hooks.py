@@ -237,6 +237,7 @@ class ClaudeHookTests(unittest.TestCase):
         from agent2telegram import attach
         from test_reply_binding import make_bridge, msg, OWNER, OTHER, GROUP
         b = make_bridge(self.root)
+        b.cfg.group_interim = True  # preserve coverage of the optional cross-chat notice
         b._turn_active.set(); b._claude_hook_ready = False
         # Absolute zero is not 'long ago' on a freshly booted CI runner (monotonic ~ uptime).
         b._last_activity = b._turn_started = time.monotonic() - attach.IDLE_DONE - 1
