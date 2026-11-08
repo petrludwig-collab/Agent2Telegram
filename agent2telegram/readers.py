@@ -28,6 +28,7 @@ from collections import deque
 import os
 import urllib.parse
 from dataclasses import dataclass
+from pathlib import Path
 from .redaction import redact
 
 
@@ -265,7 +266,7 @@ class CodexReader:
         p = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
         pt = p.get("type")
         if t == "event_msg" and pt == "task_started":
-            yield Ev("turn_start")
+            yield Ev("turn_start", key=p.get("turn_id") or "")
         elif t == "event_msg" and pt == "user_message":
             msg = p.get("message", "")
             if msg.strip():
@@ -304,9 +305,43 @@ class CodexReader:
                 key = p.get("call_id") or _hash(json.dumps(p, sort_keys=True)[:200])
             yield Ev("tool", text=_codex_tool_summary(p), key=key)
         elif t == "event_msg" and pt == "task_complete":
-            yield Ev("turn_end")
+            yield Ev("turn_end", key=p.get("turn_id") or "")
 
 
 def for_agent(agent: str):
     """Return the reader for the configured agent (defaults to Claude Code)."""
     return CodexReader() if (agent or "").lower() == "codex" else ClaudeCodeReader()
+
+
+def latest_user(path: Path, reader) -> tuple[int, dict] | None:
+    """Find the last real prompt and its byte offset, ignoring tool/harness records.
+
+    Usually the last 64 KiB suffice. Expand for long tool runs instead of losing the
+    prompt behind an arbitrary tail limit. Never accept an incomplete JSONL record.
+    """
+    try:
+        with path.open("rb") as stream:
+            size = stream.seek(0, 2)
+            window = 65536
+            while True:
+                start = max(0, size - window)
+                stream.seek(start)
+                if start:
+                    stream.readline()  # the window can start inside a record
+                found = None
+                while stream.tell() < size:
+                    offset = stream.tell()
+                    raw = stream.readline(size - offset)
+                    if not raw.endswith(b"\n"):
+                        break
+                    try:
+                        rec = json.loads(raw)
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if isinstance(rec, dict) and reader.user_text(rec):
+                        found = offset, rec
+                if found is not None or start == 0:
+                    return found
+                window *= 2
+    except OSError:
+        return None

@@ -54,13 +54,20 @@ def _all_cfgs() -> list[dict]:
     return out
 
 
-def _mark(signal: str) -> None:
+def _mark(signal: str, turn: dict) -> None:
     marker = Path(signal).parent / "turn_end"
+    pending = marker.with_name(f".turn_end-{os.getpid()}")
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(str(time.time()), encoding="utf-8")
+        pending.write_text(json.dumps({"timestamp": time.time(), **turn}), encoding="utf-8")
+        pending.replace(marker)  # the bridge must never see a partially written identity
     except OSError:
         pass
+    finally:
+        try:
+            pending.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _parent(pid: int) -> int:
@@ -112,6 +119,13 @@ def main() -> None:
     if not path:
         return
     base = os.path.basename(path)
+    # Capture the prompt BEFORE config/tmux discovery can delay the marker write.
+    # A later prompt must not make this old Stop look like the end of the new turn.
+    from .readers import ClaudeCodeReader, latest_user
+    prompt = latest_user(Path(path), ClaudeCodeReader())
+    turn = {"transcript_path": os.path.realpath(path),
+            "user_offset": prompt[0] if prompt else None,
+            "user_uuid": prompt[1].get("uuid") if prompt else None}
 
     def eligible(c):
         # Legacy configs omitted agent/mode. Never finish a Codex turn from a Claude hook.
@@ -132,7 +146,7 @@ def main() -> None:
         guard = c.get("claude_session_id", "")
         if guard:
             if base.startswith(guard):
-                _mark(c["signal_file"])
+                _mark(c["signal_file"], turn)
                 matched = True
         else:
             guardless.append(c)
@@ -141,11 +155,11 @@ def main() -> None:
         session = _own_tmux_session()
         for c in cfgs:
             if session and c.get("tmux_session") == session and c.get("claude_session_id"):
-                _mark(c["signal_file"])
+                _mark(c["signal_file"], turn)
                 matched = True
     if not matched:
         for c in guardless:
-            _mark(c["signal_file"])
+            _mark(c["signal_file"], turn)
 
 
 if __name__ == "__main__":

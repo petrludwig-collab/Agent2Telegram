@@ -530,6 +530,7 @@ class AttachBridge:
             return
         log.info("transcript → %s", newest.name)
         self._transcript = newest
+        self._transcript_turn_id = ""
         self._seek_to_turn()
         self._arm_background()
 
@@ -1544,6 +1545,13 @@ class AttachBridge:
     def _begin_turn(self) -> None:
         # Light "typing…" from the actual injection point.
         self._consume_turn_end()                 # drop any stale end-marker from a prior turn
+        path = getattr(self, "_transcript", None)
+        try:
+            size = path.stat().st_size if path is not None else 0
+        except OSError:
+            size = 0
+        # Use the actual EOF, not the tailer's cursor: unread prompts can still be history.
+        self._turn_input_boundary = (path, size, time.time())
         now = time.monotonic()
         self._turn_active.set()
         self._turn_from_tg = True
@@ -2043,13 +2051,66 @@ class AttachBridge:
                      self._typing_count, self._max_gap, from_tg_at_end, text_sent_at_end,
                      reaction_at_end)
 
-    def _end_turn(self, *, confirmed: bool = True) -> None:
+    def _end_turn(self, *, confirmed: bool = True, from_hook: bool = False) -> None:
         # Claude Stop-hook path: catch anything written just before the hook fired, then finish.
+        boundary = getattr(self, "_turn_input_boundary", None)
         self._drain_transcript()
+        has_marker = self._turn_end is not None and self._turn_end.exists()
+        if (boundary is not getattr(self, "_turn_input_boundary", None)
+                or (from_hook and not has_marker)
+                or (has_marker and not self._hook_ends_current_turn())):
+            log.info("turn end ignored: it does not belong to the current Telegram input")
+            self._consume_turn_end()
+            return
         if confirmed:
             self._finish_turn()
         else:
             self._finish_turn(confirmed=False)
+
+    def _prompt_belongs_to_turn(self, path: Path, offset: int, rec: dict) -> bool:
+        """A turn may end only after its own Telegram input reached the transcript."""
+        boundary = getattr(self, "_turn_input_boundary", None)
+        if not self._turn_active.is_set() or boundary is None:
+            return True  # no injected turn to protect (e.g. startup/background cleanup)
+        old_path, size, delivered_after = boundary
+        text = self._reader.user_text(rec)
+        origins = getattr(self, "_origins", (self.cfg.origin_prefix.strip(), "Telegram:", "[TG]"))
+        if not text or not text.lstrip().startswith(tuple(p for p in origins if p)):
+            return False
+        stamp = _record_wall_time(rec)
+        if stamp is not None:
+            # Reject old prompts flushed late; retain identity across rotation/truncation.
+            return stamp >= delivered_after
+        # Without timestamps, offsets only have meaning within the original file.
+        return old_path is not None and path.resolve() == old_path.resolve() and offset >= size
+
+    def _hook_ends_current_turn(self) -> bool:
+        if not self._turn_active.is_set() or getattr(self, "_turn_input_boundary", None) is None:
+            return True
+        try:
+            content = self._turn_end.read_text("utf-8")
+            try:
+                marker = json.loads(content)
+            except ValueError:
+                marker = None
+            if isinstance(marker, dict):
+                path = Path(marker["transcript_path"])
+                offset = marker["user_offset"]
+                if not isinstance(offset, int) or offset < 0:
+                    return False
+                with path.open("rb") as stream:
+                    stream.seek(offset)
+                    rec = json.loads(stream.readline())
+                if not isinstance(rec, dict) or rec.get("uuid") != marker.get("user_uuid"):
+                    return False
+                return self._prompt_belongs_to_turn(path, offset, rec)
+            # Older/custom hooks only write a timestamp. Check the last real prompt rather
+            # than treating the marker's arrival time as evidence of which turn it ended.
+            path = self._transcript
+            prompt = readers.latest_user(path, self._reader) if path is not None else None
+            return prompt is not None and self._prompt_belongs_to_turn(path, *prompt)
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
 
 
     def _outbound_loop(self) -> None:
@@ -2073,7 +2134,7 @@ class AttachBridge:
                     self._finish_turn()
                 elif self._turn_end is not None and self._turn_end.exists():
                     self._claude_hook_ready = True
-                    self._end_turn()
+                    self._end_turn(from_hook=True)
                 elif self._turn_active.is_set() and time.monotonic() - self._last_activity > self._idle_limit():
                     # This branch used to just close the turn: the backstop didn't run, so the
                     # reply wasn't sent and not even a log line was left. It was one of three ways
@@ -2293,7 +2354,20 @@ class AttachBridge:
                 except json.JSONDecodeError:
                     continue
                 self._rec_live = self._record_is_live(rec_off, rec)
+                # Prompt identity is independent of reader delivery dedup: the user can
+                # legitimately repeat the same question in a later turn.
+                if self._reader.user_text(rec):
+                    self._transcript_prompt = (self._transcript, rec_off, rec)
                 for ev in self._reader.parse(rec):
+                    if ev.kind == "turn_start":
+                        self._transcript_turn_id = ev.key
+                    elif ev.kind == "turn_end" and getattr(self, "_turn_input_boundary", None) is not None:
+                        prompt = getattr(self, "_transcript_prompt", None)
+                        current_id = getattr(self, "_transcript_turn_id", "")
+                        if (prompt is None or not self._prompt_belongs_to_turn(*prompt)
+                                or (ev.key and current_id and ev.key != current_id)):
+                            log.info("transcript turn end ignored: it belongs to another input or turn id")
+                            continue
                     self._handle_event(ev)
         finally:
             self._rec_live = False

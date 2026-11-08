@@ -108,7 +108,8 @@ class GroupInterimTests(unittest.TestCase):
                 thread.join(2)
 
     def test_outbound_loop_observes_hook_and_delivers_unclassified_final(self):
-        self.append(self.text("Final answer", "final"))
+        self.append({"type": "user", "message": {"content": "Telegram: Please check"}},
+                    self.text("Final answer", "final"))
         self.b._turn_end = self.b._signal.parent / "turn_end"
         self.b._turn_end.write_text("1")
         self.b._maybe_reresolve = Mock()

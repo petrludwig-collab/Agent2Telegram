@@ -266,7 +266,7 @@ class ClaudeHookTests(unittest.TestCase):
         b._end_turn = Mock()
         b._outbound_loop()
         self.assertTrue(b._claude_hook_ready)
-        b._end_turn.assert_called_once()
+        b._end_turn.assert_called_once_with(from_hook=True)
 
     def test_uninstall_honors_active_claude_directory(self):
         self.run_bridge()
