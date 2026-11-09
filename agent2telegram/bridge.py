@@ -25,7 +25,7 @@ from pathlib import Path
 from . import __version__, adapters
 from .config import Config, _state_dir
 from .redaction import message_metadata, update_metadata
-from .telegram import TelegramClient, TelegramError, is_network_error
+from .telegram import TelegramClient, TelegramError, file_media, is_network_error
 
 log = logging.getLogger("agent2telegram.bridge")
 
@@ -185,10 +185,11 @@ class Bridge:
                 self.tg.send_message(chat_id, "⚠️ Couldn't download the image.")
                 return None
             return Task(text=text, attachment=path)
-        # Document / arbitrary file.
-        if msg.get("document"):
-            doc = msg["document"]
-            path = self._download(chat_id, doc["file_id"], default_name=doc.get("file_name") or "file")
+        # Document, video, video note or GIF: hand it over as a file (issue #12).
+        found = file_media(msg)
+        if found:
+            doc, fallback = found
+            path = self._download(chat_id, doc["file_id"], default_name=doc.get("file_name") or fallback)
             if not path:
                 self.tg.send_message(chat_id, "⚠️ Couldn't download the file.")
                 return None
@@ -208,7 +209,7 @@ class Bridge:
             return Task(text=transcript)
         if text:
             return Task(text=text)
-        self.tg.send_message(chat_id, "ℹ️ I can handle text, images, files and (if enabled) voice.")
+        self.tg.send_message(chat_id, "ℹ️ I can handle text, images, videos, files and (if enabled) voice.")
         return None
 
     def _download(self, chat_id: int, file_id: str, *, default_name: str) -> str | None:

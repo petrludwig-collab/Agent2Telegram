@@ -271,8 +271,8 @@ Enable it by setting your key (get one at <https://elevenlabs.io>):
 ```bash
 export ELEVENLABS_API_KEY="sk_..."     # or put "elevenlabs_api_key" in config.json
 ```
-Without a key, voice messages get a short "not enabled" notice. Images and files work with no
-extra setup.
+Without a key, voice messages get a short "not enabled" notice. Images, videos and files work
+with no extra setup (Telegram limits what a bot can download to 20 MB).
 
 ## Configuration
 
