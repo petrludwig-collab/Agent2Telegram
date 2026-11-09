@@ -156,6 +156,22 @@ class TelegramError(Exception):
         self.network_error = network_error
 
 
+#: Inbound media handed to the agent as a downloaded file, with the name used when Telegram sends
+#: none. A gallery video or screen recording arrives as `video`, not `document`; before these were
+#: listed it was dropped without a word (issue #12). `document` comes first: a GIF carries both
+#: `animation` and `document`, and the document keeps the original file name.
+FILE_MEDIA = (("document", "file"), ("video", "video.mp4"), ("video_note", "video_note.mp4"),
+              ("animation", "animation.mp4"))
+
+
+def file_media(msg: dict) -> "tuple[dict, str] | None":
+    """The downloadable file in *msg* (other than a photo) and its fallback name, or None."""
+    for kind, default in FILE_MEDIA:
+        if msg.get(kind):
+            return msg[kind], default
+    return None
+
+
 def is_network_error(exc: BaseException) -> bool:
     """True for a transient network/DNS problem — whether direct (OSError/URLError/timeout,
     including gaierror "nodename nor servname"/Errno 8) or wrapped in ``TelegramError``

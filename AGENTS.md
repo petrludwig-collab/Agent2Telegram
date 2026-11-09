@@ -55,7 +55,7 @@ token and their Telegram user id, then write `~/.config/agent2telegram/config.js
 allowed outbox (`~/.local/state/agent2telegram/outbox` by default); anything else is refused with
 a visible message, never dropped silently.
 
-**Attachments & voice:** images and files work out of the box (they're downloaded and handed
+**Attachments & voice:** images, videos and files work out of the box (they're downloaded and handed
 to the agent). Voice transcription is optional — ask the user if they want it; if yes, add
 their **own** ElevenLabs key as `elevenlabs_api_key` (or `ELEVENLABS_API_KEY`). Never use a
 shared/hardcoded key.

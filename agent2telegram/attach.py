@@ -44,7 +44,7 @@ from .inbound import sender_label
 from .notices import busy_text, restart_notice
 from .redaction import message_metadata, update_metadata
 from .session import SessionError, TmuxSession
-from .telegram import TelegramClient, TelegramError, is_network_error, split_message
+from .telegram import TelegramClient, TelegramError, file_media, is_network_error, split_message
 
 log = logging.getLogger("agent2telegram.attach")
 
@@ -122,6 +122,9 @@ TUI_BUBBLE_GRACE = 3.0
 # Short disk ledger for Telegram update_ids already accepted by attach mode. Offset persistence is
 # the primary protection; this catches stale replays if a crash lands in the small ACK window.
 PROCESSED_UPDATE_LEDGER_LIMIT = 500
+#: User content the bridge cannot pass on. Without a caption these got no reply at all, which reads
+#: as the bot ignoring the user, so they get a short notice instead.
+UNSUPPORTED_MEDIA = ("sticker", "location", "venue", "contact", "poll", "dice")
 # Keep slow media downloads/STT from becoming a resource sink. Telegram voice notes are normally
 # tiny; 25 MB still leaves room for long clips while bounding download + STT work.
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
@@ -1406,7 +1409,7 @@ class AttachBridge:
         # puzzling over "/start". Only plain-text commands, never media captions.
         text0 = (msg.get("text") or "").strip()
         if text0.startswith("/") and not (msg.get("voice") or msg.get("audio")
-                                           or msg.get("photo") or msg.get("document")):
+                                           or msg.get("photo") or file_media(msg)):
             if self._handle_command(text0, chat_id, msg.get("message_id")):
                 return True
 
@@ -1423,11 +1426,16 @@ class AttachBridge:
             # and the agent insisted it had arrived exactly as sent. With this marker it can guess
             # from context instead.
             text = f"[voice transcript – may contain recognition errors]\n{text}"
-        elif msg.get("photo") or msg.get("document"):
+        elif msg.get("photo") or file_media(msg):
             note = self._download_note(msg, chat_id)
             if not note:
                 return True
             text = f"{text}\n{note}".strip()
+        elif not text and any(msg.get(kind) for kind in UNSUPPORTED_MEDIA):
+            self.tg.send_message(chat_id,
+                "ℹ️ I can't pass this kind of message to the agent. Send text, a photo, a video, "
+                "a file or a voice message.")
+            return True
         if text:
             text = self._prepend_reply_context(msg, text)
             if self._voice_reply_on():
@@ -2654,9 +2662,9 @@ class AttachBridge:
             file_id, default = msg["photo"][-1]["file_id"], "image.jpg"
             size = msg["photo"][-1].get("file_size")
         else:
-            doc = msg["document"]
-            file_id, default = doc["file_id"], doc.get("file_name") or "file"
-            size = doc.get("file_size")
+            media, fallback = file_media(msg)
+            file_id, default = media["file_id"], media.get("file_name") or fallback
+            size = media.get("file_size")
         # Telegram bots can only fetch files up to 20 MB via getFile — fail fast with a clear,
         # actionable message instead of a silent "couldn't download".
         if size and size > 20 * 1024 * 1024:

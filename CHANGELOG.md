@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Videos, video notes and GIFs sent to the bot reach the agent as files, like documents (#12).
+  A gallery video or a screen recording arrives as `video`, not `document`, and was dropped
+  without any reply. The 20 MB Bot API limit and its message apply to them too. Stickers,
+  locations, contacts, polls and dice now get a short "can't pass this on" notice instead of
+  silence.
 - Attach mode defaults to `group_interim: false`: group destinations receive the final
   answer and allowed attachments, with narration, tool/status bubbles, background progress,
   typing and queued-message acknowledgments suppressed. Private-chat progress is unchanged;

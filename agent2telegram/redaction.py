@@ -80,7 +80,7 @@ def update_metadata(update: dict) -> str:
     msg = update.get("message") or update.get("edited_message") or {}
     if not isinstance(msg, dict):
         msg = {}
-    media = ("photo", "document", "video", "animation", "voice", "audio", "sticker")
+    media = ("photo", "document", "video", "video_note", "animation", "voice", "audio", "sticker")
     count = sum(bool(msg.get(field)) for field in media)
     kind = ("voice" if msg.get("voice") or msg.get("audio") else "file" if count
             else "reaction" if update.get("message_reaction") else "text")
