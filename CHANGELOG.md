@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `notify --key KEY` makes a notification retry-safe: a repeated call with the same key, text and
+  target sends nothing again. A small per-key ledger in the state directory records the intent before
+  the first request, so a lost confirmation, a crash or a concurrent second process is reported as
+  `uncertain` (exit 4) or in progress (exit 5) instead of sending a duplicate. Keyed sends use no
+  internal retry or flood-control wait, and fall back to plain text only when Telegram refuses the
+  formatting itself; only a well-formed Telegram 4xx error counts as certain non-delivery. Text only; `--key` with
+  `--file` is refused. `notify-status KEY [--json]` reports the recorded state read-only. Without
+  `--key`, `notify` is unchanged.
+
 - Attach mode defaults to `group_interim: false`: group destinations receive the final
   answer and allowed attachments, with narration, tool/status bubbles, background progress,
   typing and queued-message acknowledgments suppressed. Private-chat progress is unchanged;

@@ -151,9 +151,30 @@ def _probe_video(path: str) -> dict:
 
 
 class TelegramError(Exception):
-    def __init__(self, message: str, *, network_error: bool = False):
+    def __init__(self, message: str, *, network_error: bool = False, http_status: int | None = None,
+                 description: str = ""):
         super().__init__(message)
         self.network_error = network_error
+        # Set ONLY when Telegram sent a well-formed error response (``"ok": false`` plus an integer
+        # ``error_code``); anything odd (no ``ok``, ``ok: null``, non-JSON, gateway page) leaves it None.
+        self.http_status = http_status
+        self.description = description
+
+
+def definitely_rejected(exc: TelegramError) -> bool:
+    """True only for a well-formed Telegram error response with a 4xx code (429 included: flood
+    control means the request was not processed), i.e. nothing was delivered. A network error, a
+    malformed or unrecognised answer, or a 5xx says nothing about whether the message went out."""
+    if exc.network_error:
+        return False
+    status = exc.http_status
+    return status is not None and 400 <= status < 500
+
+
+def is_parse_error(exc: TelegramError) -> bool:
+    """True for Telegram's refusal of the HTML formatting itself ("can't parse entities ...")."""
+    return (definitely_rejected(exc) and exc.http_status == 400
+            and "can't parse entities" in exc.description.lower())
 
 
 def is_network_error(exc: BaseException) -> bool:
@@ -184,14 +205,43 @@ class TelegramClient:
             text = text.replace(token, '[REDACTED]')
         return redact(text)
 
-    def _http_error(self, method: str, code: int, reason) -> TelegramError:
+    @staticmethod
+    def _well_formed_error(body, code: int | None = None) -> bool:
+        """A real Telegram error answer: ``ok`` is literally false and ``error_code`` is an integer
+        (equal to the HTTP status when one is given)."""
+        if not isinstance(body, dict) or body.get("ok") is not False:
+            return False
+        error_code = body.get("error_code")
+        return type(error_code) is int and (code is None or error_code == code)
+
+    def _http_error(self, method: str, code: int, reason, body: dict | None = None) -> TelegramError:
+        """*body* is the parsed answer when it was a well-formed Telegram error, else None."""
+        status = code if body is not None else None
         if code == 401:
-            return TelegramError('Telegram rejected the token – copy it again in full from @BotFather')
-        return TelegramError(f'{method}: HTTP {code} {self._safe_error(reason)}')
+            return TelegramError('Telegram rejected the token – copy it again in full from @BotFather',
+                                 http_status=status)
+        text = f'{method}: HTTP {code} {self._safe_error(reason)}'
+        description = ""
+        if body is not None:
+            description = self._safe_error(body.get("description", ""))
+            params = body.get("parameters")
+            retry_after = params.get("retry_after") if isinstance(params, dict) else None
+            if code == 429 and type(retry_after) is int:
+                text += f" (retry after {retry_after}s)"
+        return TelegramError(text, http_status=status, description=description)
+
+    def _error_body(self, err: urllib.error.HTTPError) -> dict | None:
+        try:
+            body = json.loads(err.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001 - not JSON / unreadable: not a Telegram answer we can trust
+            return None
+        return body if self._well_formed_error(body, err.code) else None
 
     # ---- low-level ---------------------------------------------------------
     def _call(self, method: str, params: dict | None = None, *, timeout: float = 65,
-              retries: int | None = None) -> dict:
+              retries: int | None = None, keyed: bool = False) -> dict:
+        """*keyed* (``notify --key``): success needs ``ok`` to be literally true, and a 429 is raised
+        instead of waited out and re-sent. Everything else is the shared behaviour."""
         url = f"{API_ROOT}/bot{self._token}/{method}"
         data = urllib.parse.urlencode(params or {}, doseq=True).encode()
         mx = self._max_retries if retries is None else retries
@@ -202,13 +252,16 @@ class TelegramClient:
                 req = urllib.request.Request(url, data=data, method="POST")
                 with self._opener.open(req, timeout=timeout) as resp:
                     body = json.loads(resp.read().decode("utf-8"))
-                if not body.get("ok"):
+                if (body.get("ok") is not True) if keyed else (not body.get("ok")):
+                    good = self._well_formed_error(body)
                     if body.get('error_code') == 401:
-                        raise self._http_error(method, 401, '')
-                    raise TelegramError(f"{method}: {self._safe_error(body.get('description', 'unknown error'))}")
+                        raise self._http_error(method, 401, '', body if good else None)
+                    raise TelegramError(f"{method}: {self._safe_error(body.get('description', 'unknown error'))}",
+                                        http_status=body["error_code"] if good else None,
+                                        description=self._safe_error(body.get('description', '')) if good else "")
                 return body["result"]
             except urllib.error.HTTPError as e:
-                retry_after = self._retry_after(e)
+                retry_after = self._retry_after(e) if not keyed else None   # keyed sends never wait and re-send
                 if retry_after is not None:
                     log.warning("Flood control on %s, waiting %ss", method, retry_after)
                     time.sleep(retry_after + 0.5)
@@ -217,7 +270,7 @@ class TelegramClient:
                     log.warning("%s: HTTP %s, retry %d/%d (backoff)", method, e.code, attempt, mx)
                     self._backoff(attempt)
                     continue
-                raise self._http_error(method, e.code, e.reason) from None
+                raise self._http_error(method, e.code, e.reason, self._error_body(e)) from None
             except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as e:
                 if attempt <= mx:
                     log.warning("%s: %s, retry %d/%d (backoff)", method, self._safe_error(e), attempt, mx)
@@ -470,3 +523,21 @@ class TelegramClient:
                     self._call("sendMessage", {**base, "text": chunk}, timeout=SEND_TIMEOUT)
             else:
                 self._call("sendMessage", {**base, "text": chunk}, timeout=SEND_TIMEOUT)
+
+    def send_part_once(self, chat_id: int, chunk: str) -> int | None:
+        """Send ONE message part with at most one request on the wire per attempt: no internal
+        retry (``retries=0``), no flood-control wait (a 429 is reported, not waited out and re-sent)
+        and a plain-text fallback only when Telegram refused the HTML formatting itself. Used by ``notify --key``, where a repeated request after an unclear result
+        could duplicate a message. Returns the ``message_id`` (None if the answer had none)."""
+        base = {"chat_id": chat_id, "disable_web_page_preview": "true"}
+        try:
+            result = self._call("sendMessage", {**base, "text": markdown_to_html(chunk), "parse_mode": "HTML"},
+                                timeout=SEND_TIMEOUT, retries=0, keyed=True)
+        except TelegramError as e:
+            if not is_parse_error(e):
+                raise
+            log.warning("HTML send rejected as unparsable, falling back to plain text: %s", e)
+            result = self._call("sendMessage", {**base, "text": _strip_markdown(chunk)},
+                                timeout=SEND_TIMEOUT, retries=0, keyed=True)
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        return message_id if type(message_id) is int else None   # not a bool
