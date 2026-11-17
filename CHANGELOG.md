@@ -7,7 +7,9 @@
   usable over SSH/tmux. A one-time envelope around the whole injected prompt and one atomic state file
   correlate the Telegram turn, the launched task and its completion; terminal input never inherits a
   Telegram origin; at-most-once delivery; a prompt whose correlation cannot be stored is not injected.
-  Operational correlation only, not protection against someone with the same account.
+  Operational correlation only, not protection against someone with the same account. A completion that
+  arrives during another turn is answered in-turn only for that turn's own chat; otherwise forwarding of the turn
+  is cut off and the job is delivered afterwards to its own chat.
 - Attach mode defaults to `group_interim: false`: group destinations receive the final
   answer and allowed attachments, with narration, tool/status bubbles, background progress,
   typing and queued-message acknowledgments suppressed. Private-chat progress is unchanged;

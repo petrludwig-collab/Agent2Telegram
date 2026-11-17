@@ -193,11 +193,13 @@ class Rig:
             stop_hook.main()
 
     def tick(self):
-        """One real outbound-loop iteration (drain, flush, turn end, claims)."""
+        """One real outbound-loop iteration (drain, flush, turn end, claims): the loop's own pacing wait
+        stops it after one cycle."""
         b = self.bridge
-        b._stop.clear()
-        with patch.object(b._stop, "wait", side_effect=lambda _: b._stop.set()):
+        with patch.object(b._stop, "wait",
+                          side_effect=lambda t: b._stop.set() if t == attach_mod.OUTBOUND_TICK else None):
             b._outbound_loop()
+        b._stop.clear()
 
     def end_turn(self):
         self.stop()

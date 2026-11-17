@@ -380,9 +380,12 @@ record that is exactly that envelope makes the turn a Telegram turn; background 
 that turn are bound to the chat; the completion (a `task-notification` record) is delivered once, only
 when nothing else is running and the chat is still authorised. Terminal input never joins a Telegram
 turn, never inherits its origin, and never changes the recipient of a task that is already bound; a
-completion that arrives during another turn is deferred and delivered afterwards (the agent is asked
-by a fixed prompt to report the finished task). If the state cannot be stored, the Telegram message is
-NOT typed into the session and the chat gets a fixed error; the terminal is never affected. Delivery is
+completion that arrives while ANOTHER turn runs never joins it: the job of that turn's own chat is
+answered inside the turn (once); anything else cuts off the rest of the turn (one fixed line to its chat) and a
+valid job of another chat is delivered afterwards to its own chat (the agent is asked by a fixed prompt to report
+the finished task). The recipient is stored with the turn; an inbound message never changes it (another chat is
+queued behind the running turn, a result turn is never joined). If the state cannot be stored, the Telegram message is
+NOT typed into the session and the chat gets a fixed error; every injection is a single attempt; the terminal is never affected. Delivery is
 at-most-once: after a crash mid-delivery the task is marked `uncertain` and is not retried.
 `"shared_session_nonce_ttl"` (seconds, default 600) limits the time from typing a prompt to its
 appearance in the transcript; `"shared_session_job_ttl"` (default 86400) limits how long a bound task

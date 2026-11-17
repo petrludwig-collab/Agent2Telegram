@@ -64,6 +64,9 @@ TURN_KINDS = ("tg", "notif", "other")
 #: Fixed text sent to the authorised inbound chat when a prompt is refused (R8). No dynamic content.
 REFUSED_TEXT = ("\u26a0\ufe0f This message was NOT passed to the agent: the bridge cannot store the state it "
                 "needs to track Telegram work safely. Please try again later.")
+#: Fixed service line to the turn's chat when forwarding of a turn is cut off (fail closed).
+CUT_TEXT = ("\u26a0\ufe0f The rest of this answer was withheld for safety: a background result that does "
+            "not belong to this chat arrived during the turn.")
 #: Fixed prompt for a deferred completion (the agent already saw the notification elsewhere).
 REPORT_PROMPT = "Background task {task} has finished. Report its result to the user."
 
@@ -183,6 +186,8 @@ class Outcome:
     claim: dict | None = None    # {"task", "chat", "uuid"}: this notification record started a claimed turn
     noop: bool = False           # the same record was already applied before a restart
     changed: bool = False        # the turn differs from the one before this record
+    cut: bool = False            # forwarding of the running turn must stop now (fail closed)
+    in_turn: bool = False        # a completion of this turn's own chat was answered inside the turn
 
 
 @dataclass
@@ -263,14 +268,11 @@ class SharedSession:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
+            dfd = os.open(self.path.parent, os.O_RDONLY)      # a failure here is a failed write: no effect
             try:
-                dfd = os.open(self.path.parent, os.O_RDONLY)
-                try:
-                    os.fsync(dfd)
-                finally:
-                    os.close(dfd)
-            except OSError:
-                pass
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
         except OSError as e:
             try:
                 tmp.unlink()
@@ -380,7 +382,7 @@ class SharedSession:
             self._s["transcript"] = None
             return self._reset_locked("recovering from: " + str(self.degraded))
 
-    def sync_transcript(self, path) -> Sync | None:
+    def sync_transcript(self, path, read: int = 0) -> Sync | None:
         """Check the transcript identity and say where to read from.
 
         * first ever transcript: history is history, resume at EOF (offset 0 only if a prompt was issued
@@ -403,9 +405,9 @@ class SharedSession:
                 return None
             if self.degraded is not None and not self.try_recover():
                 return Sync(ident["size"], False)
-            return self._sync_locked(ident)
+            return self._sync_locked(ident, read)
 
-    def _sync_locked(self, ident: dict) -> Sync:
+    def _sync_locked(self, ident: dict, read: int = 0) -> Sync:
         t = self._s["transcript"]
         new_t = {k: ident[k] for k in ("path", "ino", "dev", "head", "session")}
 
@@ -430,7 +432,8 @@ class SharedSession:
                          and t["dev"] == ident["dev"])
             head_ok = t["head"] == ident["head"] or (t["head"] == "" and ident["head"] != "")
             same = same_file and head_ok
-            if same and ident["size"] >= t["offset"]:
+            highest = max(t["offset"], read or 0, self._pending_off or 0)    # what was already READ
+            if same and ident["size"] >= highest:
                 if t["head"] != ident["head"]:
                     self._commit(lambda st: st["transcript"].update(head=ident["head"]))
                 return Sync(t["offset"], False)
@@ -537,6 +540,11 @@ class SharedSession:
                 self._note_offset(end)
         self.flush_offset()
 
+    def nonce_state(self, nonce: str) -> str | None:
+        with self._lock:
+            rec = (self._s or {}).get("nonces", {}).get(nonce)
+            return rec["state"] if rec else None
+
     def needs_sync(self) -> bool:
         with self._lock:
             return self._s is not None and (self.degraded is not None or self._s["transcript"] is None)
@@ -605,6 +613,18 @@ class SharedSession:
         st["jobs"][task] = {"chat": turn["chat"], "nonce": turn["nonce"], "session": nrec["session"],
                             "state": "pending", "bound_at": now, "at": now}
 
+    def _valid_pending(self, st, job, now) -> bool:
+        """A pending job that may still be delivered (TTL and session are checked and recorded)."""
+        if job is None or job["state"] != "pending":
+            return False
+        if now - job["bound_at"] > self.job_ttl:
+            job["state"], job["at"] = "expired", now
+            return False
+        if job["session"] != st["transcript"]["session"]:
+            job["state"], job["at"] = "revoked", now
+            return False
+        return True
+
     def _on_notification(self, st, offset, rec, out, kind) -> None:
         now = self._clock()
         task = notification_task_id(record_text(rec))
@@ -612,24 +632,18 @@ class SharedSession:
         turn = st["turn"]
         uuid = rec.get("uuid") if isinstance(rec.get("uuid"), str) else None
         other = {"kind": "other", "chat": None, "nonce": None, "job": None, "uuid": uuid}
-        if job is None or job["state"] != "pending":
-            if turn is None:
-                st["turn"] = other                        # the harness started a turn that is not ours
+        defer = {"task": task, "offset": offset, "seen_at": now}
+        if turn is not None:
+            self._notification_in_turn(st, out, turn, task, job, defer, now)
             return
-        if now - job["bound_at"] > self.job_ttl:
-            job["state"], job["at"] = "expired", now
-            st["turn"] = turn or other
+        if not self._valid_pending(st, job, now):
+            st["turn"] = other                            # the harness started a turn that is not ours
             return
-        if job["session"] != st["transcript"]["session"]:
-            job["state"], job["at"] = "revoked", now
-            st["turn"] = turn or other
+        if st["completions"] or self._busy():             # older deferred ones first (FIFO) / nothing may overlap
+            if not any(c["task"] == task for c in st["completions"]):
+                st["completions"].append(defer)
+            st["turn"] = other
             return
-        if not any(c["task"] == task for c in st["completions"]):
-            st["completions"].append({"task": task, "offset": offset, "seen_at": now})
-        if turn is not None or self._busy():
-            st["turn"] = turn or other                    # deferred: claimed only when nothing is running
-            return
-        st["completions"] = [c for c in st["completions"] if c["task"] != task]
         if not self._authorised(job["chat"]):
             job["state"], job["at"] = "blocked", now
             st["turn"] = other
@@ -638,6 +652,29 @@ class SharedSession:
         job["state"], job["at"] = "claimed", now          # durable intention BEFORE the turn is opened
         st["turn"] = {"kind": "notif", "chat": job["chat"], "nonce": None, "job": task, "uuid": uuid}
         out.claim = {"task": task, "chat": job["chat"], "uuid": uuid}
+
+    def _notification_in_turn(self, st, out, turn, task, job, defer, now) -> None:
+        """A completion arrives while a turn runs. Only the job of THIS turn's own chat may be answered
+        inside it (marked delivered at once, so no report follows). Anything else cuts forwarding of the
+        rest of the turn; a still-valid job of another chat stays pending for its own chat."""
+        pending = self._valid_pending(st, job, now)
+        if turn["kind"] == "other":
+            if pending and not any(c["task"] == task for c in st["completions"]):
+                st["completions"].append(defer)
+            return
+        if turn["kind"] == "notif" and turn.get("job") == task:
+            return                                        # the very completion this turn reports
+        if pending and job["chat"] == turn["chat"] and self._authorised(job["chat"]):
+            job["state"], job["at"] = "delivered", now
+            st["completions"] = [c for c in st["completions"] if c["task"] != task]
+            out.in_turn = True
+            return
+        if pending and not any(c["task"] == task for c in st["completions"]):
+            st["completions"].append(defer)
+        if not turn.get("cut"):
+            turn["cut"] = True
+            out.cut = True
+            log.warning("shared session: foreign completion inside a Telegram turn -> forwarding cut off")
 
     # ---- turn end, deferred claims, expiry ----------------------------------
     def turn_end(self, *, text_sent: bool) -> None:

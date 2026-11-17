@@ -17,7 +17,7 @@ from agent2telegram.attach import AttachBridge
 from agent2telegram.config import Config, ConfigError
 from agent2telegram.shared_session import SharedSession
 
-from n1_rig import GROUP, OWNER, RigTestCase, assistant, human, notification
+from n1_rig import GROUP, OWNER, Rig, RigTestCase, assistant, human, notification
 
 OTHER_ENV = "‹a2t:AAAAAAAAAAAAAAAAAAAAAAAAAA›"
 
@@ -481,20 +481,22 @@ class DeferredCompletionTests(RigTestCase):
         r.say("[tg] A started")
         r.end_turn()
 
-    def test_completion_during_another_telegram_turn_is_deferred_then_delivered_to_its_own_chat(self):
+    def test_other_chats_job_completing_mid_turn_is_cut_off_then_delivered_once_to_its_own_chat(self):
         r = self.rig
         self.prepare_a()
         r.tg_turn(GROUP, "other question")
-        r.notify("tA")                                                 # arrives during B's turn
-        self.assertEqual(r.job("tA"), "pending")
+        r.notify("tA")                                                 # A's job completes during B's turn
+        self.assertEqual(r.job("tA"), "pending", "state unchanged: still deferred to its own chat")
         self.assertEqual(r.n1.snapshot()["completions"][0]["task"], "tA")
-        self.assertEqual(r.n1.turn()["chat"], GROUP, "the completion does not join B's turn")
-        r.say("B answer")
+        self.assertTrue(r.n1.turn()["cut"])
+        self.assertEqual(r.sent_to(GROUP), [shared.CUT_TEXT])          # fixed service line, once
+        r.say("B answer that would carry A's result")
+        r.say("[tg] even with a marker")
         typed_before = len(r.typed)
         r.end_turn()                                                   # B ends: the deferred claim runs
+        self.assertEqual(r.sent_to(GROUP), [shared.CUT_TEXT], "nothing more of the cut turn reaches B")
         self.assertEqual(len(r.typed), typed_before + 1)
         report = shared.parse_envelope(r.typed[-1])
-        self.assertIsNotNone(report)
         self.assertIn("tA", report[1])
         self.assertEqual(r.job("tA"), "claimed")
         self.assertEqual(r.bridge._owner_chat, OWNER)
@@ -503,9 +505,64 @@ class DeferredCompletionTests(RigTestCase):
         r.say("[tg] result A")
         r.end_turn()
         self.assertEqual(r.sent_to(OWNER), ["A started", "result A"])
-        self.assertEqual(r.sent_to(GROUP), ["B answer"])
+        self.assertEqual(r.sent_to(GROUP), [shared.CUT_TEXT])
         self.assertEqual(r.job("tA"), "delivered")
         self.assertEqual(r.bridge._owner_chat, GROUP)
+
+    def test_own_job_completing_mid_turn_is_answered_in_turn_exactly_once(self):
+        r = self.rig
+        self.prepare_a()
+        r.tg_turn(OWNER, "a follow-up")
+        typed = len(r.typed)
+        r.notify("tA")                                                 # same chat as the running turn
+        self.assertEqual(r.job("tA"), "delivered")
+        self.assertEqual(r.n1.snapshot()["completions"], [])
+        r.say("[tg] tA is done, here it is")
+        r.end_turn()
+        self.assertEqual(r.sent_to(OWNER), ["A started", "tA is done, here it is"])
+        self.assertEqual(len(r.typed), typed, "no deferred report follows (no duplicate)")
+
+    def test_terminal_job_completing_mid_telegram_turn_never_reaches_telegram(self):
+        r = self.rig
+        r.terminal("start a build")
+        r.launch("term-job")
+        r.end_turn()
+        r.tg_turn(OWNER, "unrelated")
+        r.notify("term-job")
+        self.assertTrue(r.n1.turn()["cut"])
+        r.say("the terminal build finished: secrets")
+        r.say("[tg] the terminal build finished")
+        r.end_turn()
+        self.assertEqual(r.sent_to(OWNER), [shared.CUT_TEXT])
+
+    def test_unknown_or_dead_jobs_completing_mid_turn_cut_forwarding(self):
+        r = self.rig
+        r.tg_turn(OWNER)
+        r.launch("claimed-before")
+        r.end_turn()
+        r.notify("claimed-before")                                     # becomes claimed, then uncertain
+        r.end_turn()
+        for task in ("unknown-job", "claimed-before"):
+            with self.subTest(task=task):
+                r.tg_turn(OWNER, "again")
+                r.notify(task)
+                self.assertTrue(r.n1.turn()["cut"])
+                r.say("must not be forwarded")
+                r.end_turn()
+        self.assertNotIn("must not be forwarded", [t for _, t in r.client.sent])
+
+    def test_report_turn_is_not_cut_by_the_notification_it_reports(self):
+        r = self.rig
+        self.prepare_a()
+        r.terminal("busy")
+        r.notify("tA")
+        r.end_turn()
+        r.submit()                                                     # report turn for tA is running
+        r.notify("tA")                                                 # the harness re-delivers it
+        self.assertFalse(r.n1.turn().get("cut"))
+        r.say("[tg] result A")
+        r.end_turn()
+        self.assertEqual(r.sent_to(OWNER)[-1], "result A")
 
     def test_completion_during_a_terminal_turn_is_deferred(self):
         r = self.rig
@@ -909,7 +966,8 @@ class SerialAndBusyTests(RigTestCase):
             self.assertFalse(done.wait(0.3))
             self.assertEqual(len(r.typed), typed, "one Telegram turn at a time")
             r.say("[tg] done")
-            r.end_turn()
+            r.stop()
+            r.bridge._end_turn(from_hook=True)                         # no loop pacing: the waiter must not see _stop
             self.assertTrue(done.wait(5))
             t.join(5)
         self.assertEqual(len(r.typed), typed + 1)
@@ -961,6 +1019,279 @@ class SerialAndBusyTests(RigTestCase):
         r.say("[tg] explicit marker")                                  # same as before: the agent asked for it
         r.tick()
         self.assertEqual(r.sent_to(OWNER), ["explicit marker"])
+
+
+class TurnScopedRecipientTests(RigTestCase):
+    def prepare_a(self):
+        r = self.rig
+        r.tg_turn(OWNER, "job A")
+        r.launch("tA")
+        r.end_turn()
+
+    def inbound_in_thread(self, chat):
+        import threading
+        r = self.rig
+        done = threading.Event()
+        t = threading.Thread(target=lambda: (r.tg(chat, "from B"), done.set()), daemon=True)
+        t.start()
+        return t, done
+
+    def test_inbound_during_a_claimed_result_turn_is_queued_and_never_changes_the_recipient(self):
+        r = self.rig
+        self.prepare_a()
+        r.tg_turn(GROUP, "B talks")
+        r.end_turn()                                                   # last chat is B
+        r.notify("tA")                                                 # idle claim: A's result turn
+        self.assertEqual(r.bridge._owner_chat, OWNER)
+        typed = len(r.typed)
+        with patch("agent2telegram.attach.CHAT_SWITCH_POLL", 0.01):
+            t, done = self.inbound_in_thread(GROUP)
+            self.assertFalse(done.wait(0.3))
+            self.assertEqual((r.bridge._owner_chat, len(r.typed)), (OWNER, typed))
+            r.say("[tg] result A")
+            r.stop()
+            r.bridge._end_turn(from_hook=True)
+            self.assertTrue(done.wait(5))
+            t.join(5)
+        r.tick()
+        self.assertEqual(r.sent_to(OWNER)[-1:], ["result A"])
+        self.assertEqual(r.bridge._owner_chat, GROUP)
+        self.assertEqual(r.sent_to(GROUP), [])
+
+    def test_inbound_during_a_reserved_report_turn_is_queued(self):
+        r = self.rig
+        self.prepare_a()
+        r.terminal("busy")
+        r.notify("tA")
+        r.end_turn()                                                   # report for A typed, not yet consumed
+        self.assertEqual(r.bridge._owner_chat, OWNER)
+        typed = len(r.typed)
+        with patch("agent2telegram.attach.CHAT_SWITCH_POLL", 0.01):
+            t, done = self.inbound_in_thread(GROUP)
+            self.assertFalse(done.wait(0.3))
+            self.assertEqual((r.bridge._owner_chat, len(r.typed)), (OWNER, typed))
+            r.submit()                                                 # the report envelope is consumed
+            r.say("[tg] result A")
+            r.stop()
+            r.bridge._end_turn(from_hook=True)
+            self.assertTrue(done.wait(5))
+            t.join(5)
+        r.tick()
+        self.assertEqual(r.sent_to(OWNER)[-1:], ["result A"])
+        self.assertEqual(r.sent_to(GROUP), [])
+
+    def test_same_chat_may_type_ahead_without_cutting_the_running_turn(self):
+        r = self.rig
+        r.tg_turn(OWNER, "first")
+        self.assertTrue(r.tg(OWNER, "also this"))
+        self.assertTrue(r.bridge._turn_from_tg, "a running Telegram turn is not downgraded by typing ahead")
+        r.say("[tg] answer to the first")
+        r.tick()
+        self.assertEqual(r.sent_to(OWNER), ["answer to the first"])
+
+    def test_every_send_uses_the_recipient_of_the_turn_record(self):
+        r = self.rig
+        r.tg_turn(OWNER, "first")
+        r.bridge._owner_chat = GROUP                                   # something clobbers the shared variable
+        r.say("[tg] still for the turn's chat")
+        r.tick()
+        self.assertEqual(r.sent_to(OWNER), ["still for the turn's chat"])
+        self.assertEqual(r.sent_to(GROUP), [])
+
+
+class SingleAttemptTests(RigTestCase):
+    def failing_inject(self, calls):
+        def inject(*a, **k):
+            calls.append(a)
+            raise RuntimeError("timed out after the keys were typed")
+        return inject
+
+    def test_inbound_injection_is_a_single_attempt_and_is_not_retried_by_the_inbox(self):
+        r = self.rig
+        calls = []
+        r.bridge._session.inject = self.failing_inject(calls)
+        self.assertTrue(r.tg(OWNER, "x"), "handled: the user is told to resend, the inbox does not retry")
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(r.bridge._turn_active.is_set())
+        nonce = next(iter(r.n1.snapshot()["nonces"]))
+        self.assertEqual(r.n1.nonce_state(nonce), "revoked")
+        self.assertEqual(len(r.sent_to(OWNER)), 1)                      # the usual failure notice
+
+    def test_report_injection_is_a_single_attempt_and_the_job_is_uncertain(self):
+        r = self.rig
+        r.tg_turn(OWNER)
+        r.launch("t1")
+        r.end_turn()
+        r.terminal("busy")
+        r.notify("t1")
+        calls = []
+        r.bridge._session.inject = self.failing_inject(calls)
+        r.end_turn()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(r.job("t1"), "uncertain")
+        r.tick()
+        self.assertEqual(len(calls), 1)
+
+    def test_default_off_keeps_the_three_attempts(self):
+        r = self.rig
+        r.close()
+        self.addCleanup(r.env.start)                                    # RigTestCase cleanup stops it again
+        r2 = Rig(Path(self.tmpdir.name) / "off", on=False)
+        self.addCleanup(r2.close)
+        calls = []
+        r2.bridge._session.inject = self.failing_inject(calls)
+        with patch("agent2telegram.attach.INJECT_RETRY_WAIT", 0):
+            r2.tg(OWNER, "x")
+        self.assertEqual(len(calls), 3)
+
+
+class RevocationRoutingTests(RigTestCase):
+    def test_assistant_record_after_a_transcript_reset_is_not_forwarded(self):
+        r = self.rig
+        r.tg_turn(OWNER)
+        replacement = r.tmp / "new.jsonl"
+        replacement.write_text(json.dumps(human("another session", "z0")) + "\n"
+                               + json.dumps(assistant("text of the NEW session, no marker", "z1")) + "\n")
+        os.replace(replacement, r.transcript)
+        r.drain()
+        self.assertFalse(r.bridge._turn_from_tg)
+        self.assertIsNone(r.bridge._n1_turn_chat)
+        r.end_turn()
+        self.assertEqual(r.client.sent, [])
+
+    def test_degraded_store_and_its_recovery_do_not_leave_old_routing(self):
+        r = self.rig
+        clock = Clock()
+        r.n1._clock = clock
+        r.tg_turn(OWNER)
+        tmp = break_writes(r)
+        r.append(human("typed in the terminal", "t1"))
+        r.drain()                                                      # the write fails: degraded
+        r.say("leak?")
+        fix_writes(tmp)
+        clock.t += 6
+        r.tick()                                                       # recovered with everything revoked
+        self.assertIsNone(r.n1.degraded)
+        r.say("leak after recovery?")
+        r.tick()
+        self.assertEqual(r.client.sent, [])
+        self.assertFalse(r.bridge._turn_from_tg)
+
+    def test_zero_width_characters_at_the_edges_do_not_break_consumption(self):
+        r = self.rig
+        r.tg(OWNER)
+        r.submit(" \u200b" + r.typed[-1] + "\ufeff\n")
+        self.assertEqual(r.n1.turn()["kind"], "tg")
+
+
+class TruncationAndDurabilityTests(RigTestCase):
+    def test_truncation_between_stored_offset_and_read_position_revokes(self):
+        r = self.rig
+        r.tg_turn(OWNER)
+        r.launch("t1")
+        r.end_turn()
+        stored = r.n1.snapshot()["transcript"]["offset"]
+        r.append(assistant("a" * 50, "x1"), assistant("b" * 50, "x2"), assistant("c" * 50, "x3"))
+        r.drain()                                                      # read position moves, offset write is batched
+        self.assertGreater(r.bridge._tpos, stored + 100)
+        with r.transcript.open("r+b") as f:
+            f.truncate(stored + 20)
+        r.drain()
+        self.assertEqual(r.job("t1"), "revoked")
+
+    def test_replacement_with_the_same_size_is_noticed_at_equal_size(self):
+        r = self.rig
+        r.tg_turn(OWNER)
+        r.launch("t1")
+        r.end_turn()
+        size = r.transcript.stat().st_size
+        replacement = r.tmp / "same-size.jsonl"
+        first = json.dumps(human("another start", "q0")) + "\n"
+        replacement.write_text(first + "x" * (size - len(first) - 1) + "\n")
+        self.assertEqual(replacement.stat().st_size, size)
+        os.replace(replacement, r.transcript)
+        self.assertEqual(r.bridge._tpos, size)
+        r.drain()
+        self.assertEqual(r.job("t1"), "revoked")
+
+    def failing_dir_fsync(self, r):
+        real = os.open
+        state_dir = r.n1.path.parent
+
+        def fake(path, *a, **k):
+            if Path(path) == state_dir:
+                raise OSError("directory cannot be opened")
+            return real(path, *a, **k)
+        return patch("agent2telegram.shared_session.os.open", side_effect=fake)
+
+    def test_directory_fsync_failure_is_a_failed_write_for_the_nonce(self):
+        r = self.rig
+        with self.failing_dir_fsync(r):
+            self.assertTrue(r.tg(OWNER, "x"))
+        self.assertEqual(r.typed, [])
+        self.assertEqual(r.client.sent, [(OWNER, shared.REFUSED_TEXT)])
+
+    def test_directory_fsync_failure_is_a_failed_write_for_the_claim(self):
+        r = self.rig
+        r.tg_turn(OWNER)
+        r.launch("t1")
+        r.end_turn()
+        with self.failing_dir_fsync(r):
+            r.notify("t1")
+        r.say("result, no marker")
+        r.end_turn()
+        self.assertEqual(r.client.sent, [])
+        self.assertFalse(r.bridge._turn_from_tg)
+
+
+class UnconsumedReportTests(RigTestCase):
+    def test_a_report_prompt_that_is_never_consumed_releases_the_bridge(self):
+        r = self.rig
+        clock = Clock()
+        r.n1._clock = clock
+        r.tg_turn(OWNER)
+        r.launch("t1")
+        r.launch("t2")
+        r.end_turn()
+        r.terminal("busy")
+        r.notify("t1")
+        r.notify("t2")
+        r.end_turn()                                                   # report for t1 typed; the agent ignores it
+        self.assertTrue(r.bridge._turn_active.is_set())
+        typed = len(r.typed)
+        first = r.bridge._n1_report_nonce
+        clock.t += 601
+        r.tick()                                                       # released; the next claim (t2) proceeds
+        self.assertEqual(r.job("t1"), "uncertain")
+        self.assertNotEqual(r.bridge._n1_report_nonce, first)
+        self.assertEqual(r.job("t2"), "claimed")
+        self.assertEqual(len(r.typed), typed + 1)
+        self.assertEqual(r.bridge._owner_chat, OWNER)
+
+
+class FifoTests(unittest.TestCase):
+    def test_idle_notification_does_not_overtake_older_deferred_completions(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "s.jsonl"
+            transcript.write_text(json.dumps(human("h", "h0")) + "\n")
+            s = SharedSession(Path(tmp) / "st.json")
+            s.load()
+            s.sync_transcript(transcript)
+            now = 1000.0
+
+            def seed(st):
+                for t in ("old", "new"):
+                    st["jobs"][t] = {"chat": 7, "nonce": "N" * 26, "session": "s", "state": "pending",
+                                     "bound_at": now, "at": now}
+                st["completions"].append({"task": "old", "offset": 1, "seen_at": now})
+            s._clock = lambda: now
+            s._commit(seed)
+            out = s.on_record(10, 20, notification("new", "n1"))
+            self.assertIsNone(out.claim)
+            self.assertEqual([c["task"] for c in s.snapshot()["completions"]], ["old", "new"])
+            s.turn_end(text_sent=False)
+            self.assertEqual(s.claim_deferred()["task"], "old")
 
 
 class StateFileTests(unittest.TestCase):
