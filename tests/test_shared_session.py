@@ -1719,6 +1719,7 @@ class RecipientAndUncertainTests(RigTestCase):
         self.consumed_report()
         r.n1.cancel(r.bridge._route.nonce)
         self.assertEqual(r.job("t1"), "uncertain")
+        self.assertIsNone(r.n1.turn(), "the store ends the result turn with its job")
         r.tick()
         self.assertEqual(r.bridge._route.kind, "none")
         r.say("[tg] output after the job became uncertain")
@@ -1731,12 +1732,22 @@ class RecipientAndUncertainTests(RigTestCase):
         r.n1._clock = clock
         self.consumed_report()
         clock.t += 86401
-        r.tick()
+        r.n1.expire()
         self.assertEqual(r.job("t1"), "uncertain")
+        self.assertIsNone(r.n1.turn(), "the store ends the result turn with its job")
+        r.tick()
         self.assertEqual(r.bridge._route.kind, "none")
         r.say("[tg] late output")
         r.tick()
         self.assertEqual(r.sent_to(OWNER), [])
+
+    def test_the_bridge_leaves_the_route_when_the_job_is_no_longer_claimed(self):
+        r = self.rig
+        self.consumed_report()
+        r.n1._commit(lambda st: st["jobs"]["t1"].update(state="uncertain"))   # the store turn is left untouched
+        self.assertEqual(r.n1.turn()["kind"], "notif")
+        r.tick()
+        self.assertEqual(r.bridge._route.kind, "none")
 
     def test_mixed_input_on_a_report_envelope_makes_the_job_uncertain_in_the_same_write(self):
         r = self.rig
