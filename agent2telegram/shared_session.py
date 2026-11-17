@@ -71,6 +71,16 @@ CUT_TEXT = ("\u26a0\ufe0f The rest of this answer was withheld for safety: a bac
 REPORT_PROMPT = "Background task {task} has finished. Report its result to the user."
 
 
+class Route:
+    """The routing state of the running turn on the bridge side. kind: none | pending (a report prompt was
+    typed, its envelope not yet consumed) | tg | notif | other. Only tg and notif that are not cut forward."""
+    __slots__ = ("kind", "chat", "job", "nonce", "cut", "prev_owner")
+
+    def __init__(self, kind="none", chat=None, job=None, nonce=None, cut=False, prev_owner=None):
+        self.kind, self.chat, self.job, self.nonce = kind, chat, job, nonce
+        self.cut, self.prev_owner = cut, prev_owner
+
+
 class StateError(Exception):
     """The correlation state cannot be read, written or trusted."""
 
@@ -564,6 +574,11 @@ class SharedSession:
 
     def _on_human(self, st, offset, rec, out, kind) -> None:
         now = self._clock()
+        prev = st["turn"]
+        if prev and prev["kind"] == "notif":              # a result turn was interrupted: R5, not retried
+            job = st["jobs"].get(prev.get("job") or "")
+            if job and job["state"] == "claimed":
+                job["state"], job["at"] = "uncertain", now
         text = record_text(rec) if kind == "human" else ""
         consumed = None
         parsed = parse_envelope(text) if kind == "human" else None
@@ -664,17 +679,19 @@ class SharedSession:
             return
         if turn["kind"] == "notif" and turn.get("job") == task:
             return                                        # the very completion this turn reports
-        if pending and job["chat"] == turn["chat"] and self._authorised(job["chat"]):
-            job["state"], job["at"] = "delivered", now
+        own = pending and job["chat"] == turn["chat"] and self._authorised(job["chat"])
+        if own and turn["kind"] == "tg" and not turn.get("cut"):
+            job["state"], job["at"] = "delivered", now    # answered inside this running turn, once
             st["completions"] = [c for c in st["completions"] if c["task"] != task]
             out.in_turn = True
             return
         if pending and not any(c["task"] == task for c in st["completions"]):
-            st["completions"].append(defer)
-        if not turn.get("cut"):
-            turn["cut"] = True
-            out.cut = True
-            log.warning("shared session: foreign completion inside a Telegram turn -> forwarding cut off")
+            st["completions"].append(defer)               # reported later, in its own report turn (FIFO)
+        if own or turn.get("cut"):
+            return                                        # same chat, but this turn cannot carry it
+        turn["cut"] = True
+        out.cut = True
+        log.warning("shared session: foreign completion inside a Telegram turn -> forwarding cut off")
 
     # ---- turn end, deferred claims, expiry ----------------------------------
     def turn_end(self, *, text_sent: bool) -> None:

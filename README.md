@@ -384,7 +384,8 @@ completion that arrives while ANOTHER turn runs never joins it: the job of that 
 answered inside the turn (once); anything else cuts off the rest of the turn (one fixed line to its chat) and a
 valid job of another chat is delivered afterwards to its own chat (the agent is asked by a fixed prompt to report
 the finished task). The recipient is stored with the turn; an inbound message never changes it (another chat is
-queued behind the running turn, a result turn is never joined). If the state cannot be stored, the Telegram message is
+queued behind the running turn, a result turn is never joined). In this mode one gate decides every send: a terminal turn forwards nothing, not even an explicit marker.
+If the state cannot be stored, the Telegram message is
 NOT typed into the session and the chat gets a fixed error; every injection is a single attempt; the terminal is never affected. Delivery is
 at-most-once: after a crash mid-delivery the task is marked `uncertain` and is not retried.
 `"shared_session_nonce_ttl"` (seconds, default 600) limits the time from typing a prompt to its
