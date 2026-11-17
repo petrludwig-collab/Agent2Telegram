@@ -380,9 +380,9 @@ record that is exactly that envelope makes the turn a Telegram turn; background 
 that turn are bound to the chat; the completion (a `task-notification` record) is delivered once, only
 when nothing else is running and the chat is still authorised. Terminal input never joins a Telegram
 turn, never inherits its origin, and never changes the recipient of a task that is already bound; a
-completion that arrives while ANOTHER turn runs never joins it: the job of that turn's own chat is
-answered inside the turn (once); anything else cuts off the rest of the turn (one fixed line to its chat) and a
-valid job of another chat is delivered afterwards to its own chat (the agent is asked by a fixed prompt to report
+completion that arrives while ANY turn runs never joins it: a Telegram or result turn is cut off for the
+rest of its length (one fixed line to its chat, nothing launched afterwards is bound) and a valid job stays deferred
+and is delivered afterwards, once, to its own chat (the agent is asked by a fixed prompt to report
 the finished task). The recipient is stored with the turn; an inbound message never changes it (another chat is
 queued behind the running turn, a result turn is never joined). In this mode one gate decides every send: a terminal turn forwards nothing, not even an explicit marker.
 If the state cannot be stored, the Telegram message is

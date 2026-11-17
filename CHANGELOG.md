@@ -8,8 +8,8 @@
   correlate the Telegram turn, the launched task and its completion; terminal input never inherits a
   Telegram origin; at-most-once delivery; a prompt whose correlation cannot be stored is not injected.
   Operational correlation only, not protection against someone with the same account. A completion that
-  arrives during another turn is answered in-turn only for that turn's own chat; otherwise forwarding of the turn
-  is cut off and the job is delivered afterwards to its own chat. In this mode one gate decides every send to
+  arrives while a Telegram or result turn runs cuts off the rest of that turn (the agent may talk about it) and the
+  job is delivered afterwards, once, to its own chat; nothing is marked delivered before a reply was stored. In this mode one gate decides every send to
   Telegram (only a Telegram or claimed-result turn, to its own chat); terminal turns forward nothing, markers included.
 - Attach mode defaults to `group_interim: false`: group destinations receive the final
   answer and allowed attachments, with narration, tool/status bubbles, background progress,

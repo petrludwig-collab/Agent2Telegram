@@ -271,7 +271,6 @@ class AttachBridge:
     _n1 = None                  # shared_session.SharedSession, None = off (the default)
     _n1_gate = None             # RLock: a claim never overlaps an inbound message being handled
     _n1_inflight = 0            # inbound messages being handled right now
-    _n1_inflight = 0            # inbound messages being handled right now
     _n1_last_rec = 0.0          # monotonic ts of the last transcript content (idle fallback)
     _n1_run = None              # how the report prompt is started (a thread); tests run it inline
     _route = None               # shared_session.Route: THE routing state of the running turn (ON only)

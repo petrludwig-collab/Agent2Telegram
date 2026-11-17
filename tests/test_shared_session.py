@@ -509,18 +509,72 @@ class DeferredCompletionTests(RigTestCase):
         self.assertEqual(r.job("tA"), "delivered")
         self.assertEqual(r.bridge._owner_chat, GROUP)
 
-    def test_own_job_completing_mid_turn_is_answered_in_turn_exactly_once(self):
+    def test_own_completion_in_a_telegram_turn_cuts_it_and_is_delivered_exactly_once_later(self):
         r = self.rig
         self.prepare_a()
         r.tg_turn(OWNER, "a follow-up")
-        typed = len(r.typed)
         r.notify("tA")                                                 # same chat as the running turn
-        self.assertEqual(r.job("tA"), "delivered")
-        self.assertEqual(r.n1.snapshot()["completions"], [])
-        r.say("[tg] tA is done, here it is")
+        self.assertEqual(r.job("tA"), "pending", "nothing is marked delivered because a notification was seen")
+        self.assertTrue(r.n1.turn()["cut"])
+        r.say("[tg] tA is done, here it is (would be a second delivery)")
+        typed = len(r.typed)
         r.end_turn()
-        self.assertEqual(r.sent_to(OWNER), ["A started", "tA is done, here it is"])
-        self.assertEqual(len(r.typed), typed, "no deferred report follows (no duplicate)")
+        self.assertEqual(r.sent_to(OWNER), ["A started", shared.CUT_TEXT])
+        self.assertEqual(len(r.typed), typed + 1)                      # its own report turn
+        r.submit()
+        r.say("[tg] tA result")
+        r.end_turn()
+        self.assertEqual(r.sent_to(OWNER), ["A started", shared.CUT_TEXT, "tA result"])
+        self.assertEqual(r.job("tA"), "delivered")
+        r.notify("tA")
+        r.end_turn()
+        self.assertEqual(len(r.sent_to(OWNER)), 3)
+
+    def test_crash_between_the_notification_and_the_reply_loses_nothing(self):
+        r = self.rig
+        self.prepare_a()
+        r.tg_turn(OWNER, "a follow-up")
+        r.notify("tA")
+        r.new_bridge()                                                 # restart: the cut turn is restored
+        self.assertFalse(r.bridge._turn_from_tg)
+        r.say("[tg] must not be forwarded after the restart")
+        typed = len(r.typed)
+        r.end_turn()
+        self.assertEqual(r.job("tA"), "claimed")
+        self.assertEqual(len(r.typed), typed + 1)
+        self.assertNotIn("must not be forwarded after the restart", r.sent_to(OWNER))
+
+    def test_terminal_input_between_the_notification_and_the_reply_keeps_the_job_deferred(self):
+        r = self.rig
+        self.prepare_a()
+        r.tg_turn(OWNER, "a follow-up")
+        r.notify("tA")
+        r.terminal("typed over SSH")
+        self.assertEqual(r.job("tA"), "pending")
+        r.end_turn()
+        self.assertEqual(r.job("tA"), "claimed")
+
+    def test_terminal_job_completing_in_a_telegram_turn_cannot_bind_what_the_agent_launches_next(self):
+        r = self.rig
+        r.terminal("start x")
+        r.launch("X")
+        r.end_turn()
+        for number, kw in enumerate(({}, {"agent": True})):
+            r.tg_turn(OWNER, f"q{number}")
+            r.notify("X")
+            r.launch(f"Y{number}", **kw)
+            self.assertIsNone(r.job(f"Y{number}"), "the window closed at the cut")
+            r.end_turn()
+
+    def test_notification_mid_turn_does_not_break_the_hook_turn_end(self):
+        r = self.rig
+        self.prepare_a()
+        r.tg_turn(OWNER, "q")
+        r.notify("tA")
+        r.stop()
+        r.bridge._end_turn(from_hook=True)                             # the _prompt_belongs_to_turn notification path
+        self.assertIsNone(r.n1.turn(), "the turn ended (no NameError, no ignored hook)")
+        self.assertEqual(r.bridge._route.kind, "pending")              # ... and the deferred report started
 
     def test_terminal_job_completing_mid_telegram_turn_never_reaches_telegram(self):
         r = self.rig
@@ -1399,7 +1453,7 @@ class CutAndInTurnTests(RigTestCase):
         self.assertEqual(r.job("mine"), "delivered")
         self.assertEqual(r.sent_to(OWNER), [shared.CUT_TEXT, "mine result"])
 
-    def test_completion_inside_a_report_turn_of_another_job_stays_deferred(self):
+    def test_second_completion_during_a_result_turn_cuts_it_first_job_uncertain_second_later_once(self):
         r = self.rig
         self.setup_jobs("a1", "a2")
         r.terminal("busy")
@@ -1409,16 +1463,31 @@ class CutAndInTurnTests(RigTestCase):
         r.notify("a2")                                                 # same chat, other job
         self.assertEqual(r.job("a2"), "pending")
         self.assertEqual([c["task"] for c in r.n1.snapshot()["completions"]], ["a2"])
-        self.assertFalse(r.n1.turn().get("cut"))
-        r.say("[tg] a1 result")
+        self.assertTrue(r.n1.turn()["cut"])
+        r.say("[tg] a1 result, cut before any text was sent")
         r.end_turn()
-        typed = len(r.typed)
-        self.assertEqual(r.job("a2"), "claimed")                       # reported in its own report turn
+        self.assertEqual(r.job("a1"), "uncertain")
+        self.assertEqual(r.job("a2"), "claimed")                       # its own report turn
         r.submit()
         r.say("[tg] a2 result")
         r.end_turn()
-        self.assertEqual(r.sent_to(OWNER)[-2:], ["a1 result", "a2 result"])
-        self.assertEqual(len(r.typed), typed + 0)
+        self.assertEqual(r.job("a2"), "delivered")
+        self.assertEqual(r.sent_to(OWNER), [shared.CUT_TEXT, "a2 result"])
+
+    def test_text_sent_before_the_cut_makes_the_first_job_delivered(self):
+        r = self.rig
+        self.setup_jobs("a1", "a2")
+        r.terminal("busy")
+        r.notify("a1")
+        r.end_turn()
+        r.submit()
+        r.say("[tg] a1 result")
+        r.tick()
+        r.notify("a2")
+        r.say("late talk")
+        r.end_turn()
+        self.assertEqual(r.job("a1"), "delivered")
+        self.assertEqual(r.sent_to(OWNER)[:2], ["a1 result", shared.CUT_TEXT])
 
     def test_already_deferred_own_job_is_not_delivered_by_a_cut_turn(self):
         r = self.rig

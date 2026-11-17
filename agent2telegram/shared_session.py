@@ -197,7 +197,6 @@ class Outcome:
     noop: bool = False           # the same record was already applied before a restart
     changed: bool = False        # the turn differs from the one before this record
     cut: bool = False            # forwarding of the running turn must stop now (fail closed)
-    in_turn: bool = False        # a completion of this turn's own chat was answered inside the turn
 
 
 @dataclass
@@ -619,7 +618,7 @@ class SharedSession:
     def _on_tool_result(self, st, offset, rec, out, kind) -> None:
         task = launch_task_id(rec)
         turn = st["turn"]
-        if not task or not turn or turn["kind"] != "tg" or task in st["jobs"]:
+        if not task or not turn or turn["kind"] != "tg" or turn.get("cut") or task in st["jobs"]:
             return                                        # terminal / unbound turn: never inherits
         nrec = st["nonces"].get(turn["nonce"] or "")
         if not nrec or nrec["state"] != "consumed":
@@ -669,29 +668,20 @@ class SharedSession:
         out.claim = {"task": task, "chat": job["chat"], "uuid": uuid}
 
     def _notification_in_turn(self, st, out, turn, task, job, defer, now) -> None:
-        """A completion arrives while a turn runs. Only the job of THIS turn's own chat may be answered
-        inside it (marked delivered at once, so no report follows). Anything else cuts forwarding of the
-        rest of the turn; a still-valid job of another chat stays pending for its own chat."""
+        """A completion arrives while a turn runs. Nothing is EVER marked delivered here: a still-pending
+        job stays deferred (FIFO) for its own report turn. In a bridge-owned turn (tg / notif) the rest of the
+        turn's forwarding is cut off, because the agent may now talk about that result and a report would
+        follow (a second logical delivery). The cut also closes the binding window."""
         pending = self._valid_pending(st, job, now)
-        if turn["kind"] == "other":
-            if pending and not any(c["task"] == task for c in st["completions"]):
-                st["completions"].append(defer)
-            return
         if turn["kind"] == "notif" and turn.get("job") == task:
             return                                        # the very completion this turn reports
-        own = pending and job["chat"] == turn["chat"] and self._authorised(job["chat"])
-        if own and turn["kind"] == "tg" and not turn.get("cut"):
-            job["state"], job["at"] = "delivered", now    # answered inside this running turn, once
-            st["completions"] = [c for c in st["completions"] if c["task"] != task]
-            out.in_turn = True
-            return
         if pending and not any(c["task"] == task for c in st["completions"]):
-            st["completions"].append(defer)               # reported later, in its own report turn (FIFO)
-        if own or turn.get("cut"):
-            return                                        # same chat, but this turn cannot carry it
+            st["completions"].append(defer)
+        if turn["kind"] == "other" or turn.get("cut"):
+            return
         turn["cut"] = True
         out.cut = True
-        log.warning("shared session: foreign completion inside a Telegram turn -> forwarding cut off")
+        log.warning("shared session: completion inside a Telegram turn -> forwarding cut off")
 
     # ---- turn end, deferred claims, expiry ----------------------------------
     def turn_end(self, *, text_sent: bool) -> None:
