@@ -76,6 +76,9 @@ class Config:
     # (one message edited in place) and tool calls of turns not started from Telegram (e.g. a
     # background-task notification). Off by default: it adds messages to the owner's chat.
     background_progress: bool = False
+    # Opt-in: deliver nothing derived from the agent transcript; only typed fixed service replies
+    # leave the bridge (see outbound_policy.py). Attach mode only. Default off = unchanged.
+    explicit_only_outbound: bool = False
     background_edit_interval: float = 10.0   # min seconds between edits of the progress message
     background_stale_after: float = 300.0    # silent this long → progress is dropped/deleted
 
@@ -156,6 +159,16 @@ class Config:
             raise ConfigError("'poll_timeout' must be positive.")
         if self.mode not in ("oneshot", "attach"):
             raise ConfigError("'mode' must be one of: oneshot, attach.")
+        if type(self.explicit_only_outbound) is not bool:
+            raise ConfigError("'explicit_only_outbound' must be a boolean.")
+        if self.explicit_only_outbound:
+            if self.mode != "attach":
+                raise ConfigError("'explicit_only_outbound' requires mode 'attach'.")
+            for name, bad in (("background_progress", self.background_progress),
+                              ("group_marker", bool(self.group_marker)),
+                              ("restart_notice_text", bool(self.restart_notice_text))):
+                if bad:
+                    raise ConfigError(f"'{name}' cannot be combined with 'explicit_only_outbound'.")
 
     def redacted(self) -> dict:
         """A copy safe to print/log: the token is masked."""
@@ -215,6 +228,12 @@ def load(path: Path | None = None) -> Config:
             secret_sources[name] = _SOURCE_ENV
             raw[name] = env_value
     known = {f for f in Config.__dataclass_fields__}
+    if raw.get("explicit_only_outbound") is True:
+        # Strict in this mode: a typo must never silently leave passive forwarding on.
+        unknown = sorted(str(k) for k in raw if k not in known)
+        if unknown:
+            raise ConfigError("unknown config keys are rejected in explicit-only mode: "
+                              + ", ".join(unknown))
     cfg = Config(**{k: v for k, v in raw.items() if k in known})
     _set_secret_metadata(cfg, secret_sources, file_secret_values)
     cfg.validate()

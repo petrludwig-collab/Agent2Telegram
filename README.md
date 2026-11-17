@@ -261,6 +261,28 @@ Notification routing logs contain the destination ID, without the message text.
 
 ---
 
+## Explicit-only outbound (opt-in)
+
+`"explicit_only_outbound": true` (attach mode only; default `false` changes nothing) stops the
+bridge from delivering anything derived from the agent transcript: replies, narration, tool/status
+bubbles, typing, files, voice, the turn-end backstop, background progress and replay of queued
+output. What still leaves the bridge: fixed bridge replies built from templates out of structured
+values (`/help`, `/id`, `/status`, authorization and input-error replies, the optional restart
+notice) and anything you send yourself with `agent2telegram notify`. Authorized inbound messages
+still reach the agent. State-revealing replies (queued/busy acknowledgments) are off, `/voice` and
+`/setkey` answer "Not available in explicit-only mode", and `deleteMessage` is not used.
+
+- The config is strict: a wrong type, a mode other than `attach`, `background_progress`,
+  `group_marker`, `restart_notice_text`, or any unknown key is rejected before anything runs.
+  Older versions ignore the key, so check `agent2telegram doctor` (it prints
+  `outbound_policy: explicit-only supported`) before relying on it.
+- If an outbound queue from an earlier run is still present (`<state>/queue/outbox/*`,
+  `outbound_queue_<session>.jsonl`), `run` refuses to start (exit code 3) and leaves it untouched.
+  Drain it under default mode or move it aside yourself.
+- Threat model: the guard protects against the bridge's own passive paths. Code running inside the
+  bridge process (a subclass, raw `urllib`, a client reference kept by the caller) is trusted,
+  and the agent itself can still call `notify` or use the token. It is not a sandbox.
+
 ## Voice messages (optional)
 
 Voice notes are transcribed with **ElevenLabs Scribe** (`scribe_v1`) and the transcript is

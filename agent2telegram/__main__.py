@@ -58,7 +58,12 @@ def _cmd_run(args) -> int:
             from .claude_hooks import register
             register(cfg)
         from .attach import AttachBridge
-        AttachBridge(cfg).run()
+        from .outbound_policy import EXIT_QUEUE_PRESENT, OutboundQueuePresent
+        try:
+            AttachBridge(cfg).run()
+        except OutboundQueuePresent as e:
+            print(f"✗ {e}", file=sys.stderr)
+            return EXIT_QUEUE_PRESENT
     else:
         from .bridge import Bridge
         Bridge(cfg).run()
@@ -154,6 +159,8 @@ def _cmd_doctor(args) -> int:
         print(f"✗ config: {e}", file=sys.stderr)
         return 2
     print("config:", cfg.redacted())
+    print("outbound_policy: explicit-only supported (v1); explicit_only_outbound="
+          f"{cfg.explicit_only_outbound}")
     cls = adapters.REGISTRY.get(cfg.agent)
     if cls is None:
         print(f"✗ unknown agent '{cfg.agent}'")

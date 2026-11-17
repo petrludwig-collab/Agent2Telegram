@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Opt-in `explicit_only_outbound` (attach mode, default off = unchanged): nothing derived from
+  the agent transcript is delivered to Telegram (text, bubbles, typing, files, voice, backstop,
+  background progress, queue replay). Only fixed, typed bridge replies and the independent
+  `notify` CLI still send. Strict config in this mode; a pending outbound queue makes `run`
+  exit with code 3 without touching it. `doctor` reports the capability.
 - Attach mode defaults to `group_interim: false`: group destinations receive the final
   answer and allowed attachments, with narration, tool/status bubbles, background progress,
   typing and queued-message acknowledgments suppressed. Private-chat progress is unchanged;

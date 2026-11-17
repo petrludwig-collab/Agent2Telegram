@@ -27,6 +27,10 @@ def waiting_for_turn_end_text(cfg):
     return '⏳ Your message is queued until the previous turn confirms completion. Reply routing stays protected.'
 
 
+def default_restart_text(language):
+    return '🔄 Most je znovu připojený.' if language == 'cs' else '🔄 Bridge started and connected.'
+
+
 def restart_notice(bridge, chat_id):
     """Call once after startup checks, never from the poll/health loop.
 
@@ -59,10 +63,12 @@ def restart_notice(bridge, chat_id):
             except FileNotFoundError:
                 pass
             _atomic_write_json(marker, {'at':now, 'pid':os.getpid()})
-            text = cfg.restart_notice_text or (
-                '🔄 Most je znovu připojený.' if cfg.language == 'cs'
-                else '🔄 Bridge started and connected.')
-            bridge.tg.send_message(chat_id, text)
+            text = cfg.restart_notice_text or default_restart_text(cfg.language)
+            if getattr(bridge, '_explicit_only', False):
+                from .outbound_policy import RestartNotice
+                bridge.tg.send_service(chat_id, RestartNotice(cfg.language))
+            else:
+                bridge.tg.send_message(chat_id, text)
             log.info('startup notice sent')
     except AlreadyRunning:
         return

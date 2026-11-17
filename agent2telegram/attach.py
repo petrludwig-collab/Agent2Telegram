@@ -42,6 +42,7 @@ from .config import Config, _state_dir
 from .durable import DurableInbox, DurableOutbox
 from .inbound import sender_label
 from .notices import busy_text, restart_notice
+from . import outbound_policy as op
 from .redaction import message_metadata, update_metadata
 from .session import SessionError, TmuxSession
 from .telegram import TelegramClient, TelegramError, is_network_error, split_message
@@ -250,6 +251,7 @@ def _in_test_run() -> bool:
 
 
 class AttachBridge:
+    _explicit_only = False      # class default for instances built without __init__ (tests)
     _turn_end_backstop_enabled = True
     _group_reply = None          # last group-bound text, held until the turn ends
     _group_files = ()            # native file-tool attachments held for the same turn
@@ -271,6 +273,11 @@ class AttachBridge:
             raise ValueError("attach mode requires 'tmux_session' in config")
         self.cfg = cfg
         self.tg = client or TelegramClient(cfg.token)
+        self._explicit_only = getattr(cfg, "explicit_only_outbound", False) is True
+        if self._explicit_only:
+            # Sink-level: whatever client we were given is wrapped HERE, so every subsystem
+            # (watcher, notices, handlers) shares the guard. Default mode: untouched.
+            self.tg = op.OutboundGuard(self.tg, BOT_COMMANDS)
         self._reaction_seen: dict = {}   # (chat, msg, emoji) -> first reaction timestamp
         self._allowed = set(cfg.allowed_user_ids)
         self._marker = cfg.progress_marker
@@ -613,6 +620,8 @@ class AttachBridge:
             ) from None
 
     def _run_locked(self) -> None:
+        if self._explicit_only:
+            self._preflight_queues()    # under the instance lock, before anything else
         me = self.tg.get_me()
         log.info("Attach bridge live as @%s → tmux '%s', owner=%s",
                  me.get("username"), self.cfg.tmux_session, self._owner_chat)
@@ -628,14 +637,16 @@ class AttachBridge:
             if self._sent_keys:
                 self._resume_position()
         self._arm_background()              # everything already in the transcript is history
-        self._cleanup_orphan_status()       # remove a bubble orphaned by a prior crash/restart
-        self._start_background()
+        if not self._explicit_only:         # deleting/watching is passive-path housekeeping
+            self._cleanup_orphan_status()   # remove a bubble orphaned by a prior crash/restart
+            self._start_background()
         if self.cfg.restart_notice and self._session._pane_ok()[0]:
             restart_notice(self, self._owner_chat)
         # Typing runs in its own thread so a flood-control sleep in the send path never starves it.
         threading.Thread(target=self._outbound_loop, daemon=True).start()
-        threading.Thread(target=self._typing_loop, daemon=True).start()
-        if self.cfg.agent == "codex":
+        if not self._explicit_only:
+            threading.Thread(target=self._typing_loop, daemon=True).start()
+        if self.cfg.agent == "codex" and not self._explicit_only:
             # Codex logs tools to the rollout only at completion → scrape the TUI for LIVE bubbles.
             threading.Thread(target=self._tui_scrape_loop, daemon=True).start()
         self._inbound_loop()
@@ -854,6 +865,27 @@ class AttachBridge:
         """Telegram group/supergroup ids are negative. Apply policy to the actual destination."""
         return chat is None or chat >= 0 or getattr(self.cfg, "group_interim", False) is True
 
+    def _reply(self, chat_id, text, typed, **kw) -> None:
+        """A fixed bridge reply. Default mode: exactly the old call. Explicit-only: the typed
+        ServiceReply (text built from a fixed template) through the guard's single door."""
+        if self._explicit_only:
+            self.tg.send_service(chat_id, typed)
+        else:
+            self.tg.send_message(chat_id, text, **kw)
+
+    def _preflight_queues(self) -> None:
+        """Explicit-only start gate (AK4): any pending durable/legacy record ⇒ refuse to start.
+        Raw read-only scan, BEFORE any DurableOutbox is constructed (its maintenance moves
+        files). Nothing is sent, moved or deleted."""
+        queue_path = getattr(self, "_queue_path", None)
+        root = (Path(queue_path).parent if queue_path is not None else _state_dir(self.cfg)) / "queue"
+        found = op.scan_queues(root, queue_path)
+        if found:
+            raise op.OutboundQueuePresent(
+                f"explicit-only outbound refuses to start: {len(found)} pending outbound queue "
+                "file(s) of unknown origin were left untouched: " + ", ".join(found)
+                + ". Drain them under default mode or move them aside yourself, then restart.")
+
     def _load_queue(self) -> list:
         if self._queue_path is None or not self._queue_path.exists():
             return []
@@ -868,7 +900,7 @@ class AttachBridge:
         return out
 
     def _persist_queue(self) -> None:
-        if self._queue_path is None:
+        if self._queue_path is None or self._explicit_only:
             return
         try:
             self._queue_path.parent.mkdir(parents=True, exist_ok=True)
@@ -882,6 +914,8 @@ class AttachBridge:
 
     def _enqueue(self, text: str, key: str | None, *, turn_text: bool = True,
                  chat: "int | None" = None) -> None:
+        if self._explicit_only:
+            return
         item = {"text": text, "key": key}
         if chat is not None:
             item["chat"] = chat
@@ -922,6 +956,9 @@ class AttachBridge:
         """Forward one reply RELIABLY. Marks the dedup ledger only AFTER a confirmed send; on any
         send failure the reply is queued to disk and the outbound loop keeps retrying until Telegram
         confirms. Order is preserved: if anything is already queued, this appends behind it."""
+        if self._explicit_only:
+            log.info("explicit-only: passive forward dropped %s", message_metadata(text))
+            return
         text, target = self._route_group_marker(text)
         if target is None or (not text and not getattr(self, "_pending_files", None)):
             return
@@ -1002,7 +1039,7 @@ class AttachBridge:
         # Attach mode only. StreamBridge shares this code but has its own queue alongside the
         # configs and a different lifecycle — switching it without a spec change would be an
         # unrequested behaviour change (and its test correctly caught that).
-        if not getattr(self, "_use_durable_outbox", False):
+        if not getattr(self, "_use_durable_outbox", False) or getattr(self, "_explicit_only", False):
             return None
         outbox = getattr(self, "_outbox", None)
         if outbox is None:
@@ -1035,6 +1072,8 @@ class AttachBridge:
     def _flush_pending(self) -> None:
         """Deliver the queue FIFO, stopping at the first failure to preserve order. Called every
         outbound cycle, so a network hiccup self-heals within one tick."""
+        if self._explicit_only:
+            return                      # queues are never opened, flushed or deleted here
         outbox = self._ensure_outbox()
         while outbox is not None and self._owner_chat is not None:
             rec = outbox.head()
@@ -1375,7 +1414,7 @@ class AttachBridge:
         user_id = msg.get("from", {}).get("id")
         chat_id = msg["chat"]["id"]
         if user_id not in self._allowed:
-            self.tg.send_message(chat_id, "⛔ Not authorized.")
+            self._reply(chat_id, "⛔ Not authorized.", op.NotAuthorized())
             return True
         chat_type = (msg.get("chat") or {}).get("type")
         in_group = chat_type in ("group", "supergroup")
@@ -1385,7 +1424,8 @@ class AttachBridge:
             if groups and chat_id not in groups:
                 return True                      # foreign group: silent, never routed
         elif user_id in (getattr(self.cfg, "group_only_user_ids", []) or []):
-            self.tg.send_message(chat_id, "⛔ Not authorized here – please use the shared group.")
+            self._reply(chat_id, "⛔ Not authorized here – please use the shared group.",
+                        op.NotAuthorizedHere())
             return True
 
         from .mentions import accepts_message
@@ -1469,7 +1509,7 @@ class AttachBridge:
                           chat_id, CHAT_SWITCH_MAX_WAIT)
                 try:
                     from .notices import waiting_for_turn_end_text
-                    if self._interim_allowed(chat_id):
+                    if self._interim_allowed(chat_id) and not self._explicit_only:
                         self.tg.send_message(chat_id, busy_text(self.cfg) if self._busy_for_notice()
                                              else waiting_for_turn_end_text(self.cfg))
                 except Exception as e:
@@ -1498,6 +1538,8 @@ class AttachBridge:
         The bridge writes this operational notice in cfg.language, independently of STT
         and of the model's own responses. The default preserves existing English behavior.
         """
+        if self._explicit_only:
+            return                      # a state-revealing reply: blocked in this mode
         if not self._busy_for_notice():
             log.debug("ACK not sent: no recent evidence of work in progress")
             return
@@ -1587,7 +1629,7 @@ class AttachBridge:
                 self._tui_seen = set()
         else:
             self._tui_seen = set()
-        if self._interim_allowed(self._owner_chat):
+        if self._interim_allowed(self._owner_chat) and not self._explicit_only:
             self.tg.send_chat_action(self._owner_chat, "typing")   # instant, don't wait for the loop
             self._typing_count = 1
         log.info("TURN START t=%.2f", time.time())
@@ -1635,6 +1677,12 @@ class AttachBridge:
         """Tell the owner their message did not get through — better twice than never."""
         if not self._owner_chat:
             return
+        if self._explicit_only:
+            try:
+                self.tg.send_service(self._owner_chat, op.InjectFailed(INJECT_ATTEMPTS))
+            except Exception as e:
+                log.warning("inject-failure notification failed: error=%s", type(e).__name__)
+            return
         preview = text.strip().replace("\n", " ")
         if len(preview) > 80:
             preview = preview[:80] + "…"
@@ -1662,6 +1710,9 @@ class AttachBridge:
             return
         self._last_pane_warning = now
         try:
+            if self._explicit_only:
+                self.tg.send_service(self._owner_chat, op.UnsafePane())
+                return
             self.tg.send_message(
                 self._owner_chat,
                 "⚠️ Agent2Telegram blocked a Telegram message because the configured tmux "
@@ -1678,6 +1729,15 @@ class AttachBridge:
         arg = parts[1].strip() if len(parts) > 1 else ""
         labels = {"codex": "Codex", "claude-code": "Claude Code"}
         agent = labels.get(self.cfg.agent, self.cfg.agent)
+        if self._explicit_only:
+            typed = {"start": op.Help(), "help": op.Help(), "id": op.ChatId(chat_id),
+                     "status": op.Status(self.cfg.agent),
+                     "setkey": op.NotAvailableExplicitOnly(),   # would need deleteMessage
+                     "voice": op.NotAvailableExplicitOnly()}.get(cmd)
+            if typed is None:
+                return False            # unknown command → agent, as before
+            self.tg.send_service(chat_id, typed)
+            return True
         if cmd in ("start", "help"):
             voice = "on" if self.cfg.elevenlabs_api_key else "off — enable with /setkey"
             self.tg.send_message(chat_id,
@@ -1714,7 +1774,8 @@ class AttachBridge:
 
     def _voice_reply_on(self) -> bool:
         """Voice replies only when the switch is on AND a key exists to actually synthesize."""
-        return bool(getattr(self, "_voice_on", False) and self.cfg.elevenlabs_api_key)
+        return bool(not self._explicit_only and getattr(self, "_voice_on", False)
+                    and self.cfg.elevenlabs_api_key)
 
     def _set_voice_state(self, on: bool) -> None:
         self._voice_on = on
@@ -1995,7 +2056,9 @@ class AttachBridge:
         # or interim forwarding missed it), deliver the final assistant message now. The
         # `_turn_text_sent` guard means this only fires when truly nothing was sent (no double-send),
         # and _send_final sets it True so a second _finish_turn won't re-fire.
-        if (was_active and self._turn_from_tg and not self._turn_text_sent
+        if self._explicit_only:
+            log.info("TURN END explicit-only: no transcript-derived delivery")
+        elif (was_active and self._turn_from_tg and not self._turn_text_sent
                 and not getattr(self, "_turn_is_reaction", False)
                 and self._owner_chat is not None
                 and getattr(self, "_turn_end_backstop_enabled", True)):
@@ -2240,7 +2303,7 @@ class AttachBridge:
 
     # ---- live tool-call status bubble (shown during the turn, deleted at the end) ------
     def _status_push(self, line: str, *, background: bool = False) -> None:
-        if not self._interim_allowed(self._owner_chat):
+        if self._explicit_only or not self._interim_allowed(self._owner_chat):
             return
         # Single line, emoji at the start, rendered in italics. One bubble is edited in place
         # across a run of consecutive tool calls; it's deleted when the next progress message
@@ -2309,6 +2372,8 @@ class AttachBridge:
             pass
 
     def _drain_signal(self) -> None:
+        if self._explicit_only:
+            return                      # the signal file is agent-written content: left alone
         answer = self._consume_signal_text()
         if not answer:
             return
@@ -2416,6 +2481,8 @@ class AttachBridge:
     def _send_files(self, paths: list[str]) -> None:
         """Upload the requested files. A rejection is always reported back to the chat —
         silently dropping an attachment would be worse than a visible error."""
+        if getattr(self, "_explicit_only", False):
+            return
         for raw in paths:
             resolved, reason = self._safe_outbox_path(raw)
             if resolved is None:
@@ -2524,6 +2591,8 @@ class AttachBridge:
         if ev.kind == "turn_end":
             self._pending_turn_end = True       # outbound loop finishes the turn after this drain
             return
+        if self._explicit_only:
+            return                              # transcript text/files/tools never reach Telegram
         if self._owner_chat is None:
             return
         if ev.kind in ("tool", "files", "text"):
@@ -2588,19 +2657,21 @@ class AttachBridge:
     # ---- media helpers (reuse the same download/STT as one-shot mode) ------
     def _reject_audio_too_large(self, chat_id: int, size: int | None) -> None:
         mb = (int(size or 0) + 1024 * 1024 - 1) // (1024 * 1024)
-        self.tg.send_message(
+        self._reply(
             chat_id,
             f"🎤 That audio is ~{mb} MB. Voice/audio limit is 25 MB — "
             "please send a shorter clip or write it as text.",
+            op.AudioTooLarge(mb),
         )
 
     def _limit_inbound_prompt(self, text: str, chat_id: int) -> str | None:
         if len(text) <= MAX_INBOUND_PROMPT_CHARS:
             return text
-        self.tg.send_message(
+        self._reply(
             chat_id,
             f"⚠️ That message is too long after processing ({len(text)} characters). "
             f"Please shorten it to {MAX_INBOUND_PROMPT_CHARS} characters or less.",
+            op.PromptTooLong(len(text), MAX_INBOUND_PROMPT_CHARS),
         )
         log.warning("inbound prompt too long: %d characters", len(text))
         return None
@@ -2608,9 +2679,10 @@ class AttachBridge:
     def _transcribe(self, media: dict, chat_id: int) -> str | None:
         from . import stt
         if not self.cfg.elevenlabs_api_key:
-            self.tg.send_message(chat_id,
+            self._reply(chat_id,
                 "🎤 Voice transcription isn't enabled yet. Add your ElevenLabs key with "
-                "`/setkey <your-key>` (I'll delete the message right after) — then resend the voice note.")
+                "`/setkey <your-key>` (I'll delete the message right after) — then resend the voice note.",
+                op.SttNotEnabled())
             return None
         try:
             size = int(media.get("file_size") or 0)
@@ -2633,6 +2705,9 @@ class AttachBridge:
         except stt.EmptyTranscript:
             # Silent or accidentally sent note: the user's side, not a bridge fault.
             log.warning("voice note had no speech")
+            if self._explicit_only:
+                self.tg.send_service(chat_id, op.SttNoSpeech())
+                return None
             self._send_final(
                 "🎤 I couldn't hear any speech in that voice note. Please record it again.",
                 turn_text=False,
@@ -2640,6 +2715,9 @@ class AttachBridge:
             return None
         except Exception as e:
             log.error("transcription failed: %s", e)
+            if self._explicit_only:
+                self.tg.send_service(chat_id, op.SttFailed())
+                return None
             # This is an inbound voice-note failure, not agent output for the current turn.
             self._send_final(
                 f"🎤 Voice transcription failed ({e}). "
@@ -2660,9 +2738,10 @@ class AttachBridge:
         # Telegram bots can only fetch files up to 20 MB via getFile — fail fast with a clear,
         # actionable message instead of a silent "couldn't download".
         if size and size > 20 * 1024 * 1024:
-            self.tg.send_message(chat_id,
+            self._reply(chat_id,
                 f"⚠️ That file is ~{size // 1024 // 1024} MB. Telegram bots can only receive files up "
-                "to 20 MB — please share a link (Drive/Dropbox) or a smaller/zipped version.")
+                "to 20 MB — please share a link (Drive/Dropbox) or a smaller/zipped version.",
+                op.FileTooBig(size // 1024 // 1024))
             log.warning("attachment '%s' too big for the Bot API: %s bytes", default, size)
             return ""
         try:
@@ -2670,8 +2749,9 @@ class AttachBridge:
             data = self.tg.download(fp)
         except Exception as e:
             log.warning("attachment '%s' download failed: %s", default, e)
-            self.tg.send_message(chat_id,
-                "⚠️ Couldn't download the attachment (too large, or a transient error — try again).")
+            self._reply(chat_id,
+                "⚠️ Couldn't download the attachment (too large, or a transient error — try again).",
+                op.DownloadFailed())
             return ""
         name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(default).name) or "file"
         if "." not in name and (ext := Path(fp).suffix):
