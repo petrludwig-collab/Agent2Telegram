@@ -246,7 +246,30 @@ class Config_(Base):
                 contextlib.redirect_stdout(out):
             _cmd_doctor(SimpleNamespace(config=None))
         self.assertIn("explicit-only supported", out.getvalue())
-        self.assertIn("explicit_only_outbound=True", out.getvalue())
+        self.assertIn("explicit_only_outbound=True; ACTIVE for this config", out.getvalue())
+
+    def run_doctor(self, **raw):
+        from agent2telegram.__main__ import _cmd_doctor
+        data = {"agent": "claude-code", "token": "1:abc", "allowed_user_ids": [7],
+                "tmux_session": "t", "mode": "attach"}
+        data.update(raw)
+        p = self.root / "cfg.json"
+        p.write_text(json.dumps(data))
+        out = io.StringIO()
+        client = mock.Mock()
+        client.get_me.return_value = {"username": "bot"}
+        with mock.patch("agent2telegram.telegram.TelegramClient", return_value=client), \
+                contextlib.redirect_stdout(out):
+            _cmd_doctor(SimpleNamespace(config=str(p)))
+        return out.getvalue()
+
+    def test_doctor_says_inactive_when_the_key_is_mistyped_or_off(self):
+        typo = self.run_doctor(explicit_only_outbond=True)
+        self.assertIn("INACTIVE for this config", typo)
+        self.assertNotIn("ACTIVE for this config", typo.replace("INACTIVE", ""))
+        self.assertIn("explicit_only_outbond", typo)           # the ignored key is named
+        self.assertIn("INACTIVE", self.run_doctor())
+        self.assertIn("ACTIVE for this config", self.run_doctor(explicit_only_outbound=True).replace("INACTIVE", "X"))
 
 
 class BlockedPassivePaths(Base):
@@ -399,10 +422,12 @@ class BlockedPassivePaths(Base):
         self.assertEqual(g._call("sendMessage", {"text": "x"}), [])
         self.assertEqual(g._call("sendPhoto", {}), [])
         g.set_my_commands([{"command": "x", "description": "transcript text"}])
+        self.assertIsNone(g._call_multipart("sendDocument", {}, "f", "n", b""))   # unknown: no raise
+        self.assertIsNone(g.some_future_method(7, "x"))
         with self.assertRaises(AttributeError):
-            g._call_multipart
+            g.__deepcopy__                                  # protocol probes stay normal
         self.assertEqual(self.rec.calls, [])
-        self.assertEqual(len(g.denied), 10)
+        self.assertEqual(len(g.denied), 12)
 
 
 class AllowedPaths(Base):
@@ -465,11 +490,13 @@ class AllowedPaths(Base):
     def test_typed_door_only(self):
         b = self.bridge()
         g = b.tg
-        g.send_service(7, op.ChatId(7))
+        g.send_service(op.ChatId(7))
         self.assertEqual(self.rec.texts(), ["Your Telegram id: `7`"])
         n = len(g.denied)
-        g.send_service(7, "free text")                 # no free-text API
-        g.send_service(7, "[TG] looks like a reply")
+        g.send_service("free text")                    # no free-text API
+        g.send_service("[TG] looks like a reply")
+        with self.assertRaises(TypeError):
+            g.send_service(7, op.ChatId(7))            # the recipient is only in the reply
         self.assertEqual(len(g.denied), n + 2)
         with self.assertRaises(TypeError):
             op.ChatId("7")
@@ -482,8 +509,8 @@ class AllowedPaths(Base):
         b.tg.set_my_commands(BOT_COMMANDS)
         b.tg.get_me()
         b.tg._call("getUpdates", {})
-        b.tg.send_service(7, op.ReactionAck(7, 3))
-        b.tg.send_service(7, op.CallbackAck("12345"))
+        b.tg.send_service(op.ReactionAck(7, 3))
+        b.tg.send_service(op.CallbackAck("12345"))
         names = [(c[0], c[1][0] if c[0] == "_call" else None) for c in self.rec.calls]
         self.assertEqual(names, [("set_my_commands", None), ("get_me", None), ("_call", "getUpdates"),
                                  ("_call", "setMessageReaction"), ("_call", "answerCallbackQuery")])
@@ -493,6 +520,27 @@ class AllowedPaths(Base):
         self.assertEqual(self.rec.calls[0][1][0], BOT_COMMANDS)
         with self.assertRaises(TypeError):
             op.ReactionAck(7, "3")
+
+    def test_unknown_guard_method_does_not_break_the_inbound_loop(self):
+        b = self.bridge()
+        handled = []
+        polls = []
+        def fake(method, params=None, **kw):
+            polls.append(method)
+            if handled or len(polls) > 500:      # stop only once the worker thread handled it
+                b._stop.set()
+                return []
+            time.sleep(0.01)
+            return [self.msg("hi")] if len(polls) == 1 else []
+        self.rec._call = fake
+        def handle(upd):
+            handled.append(b.tg.brand_new_method(7, "x"))
+            return True
+        b._handle = handle
+        b._inbound_loop()
+        self.assertEqual(handled, [None])
+        self.assertEqual(self.rec.content(), [])
+        self.assertTrue(any("brand_new_method" in d for d in b.tg.denied))
 
     def test_row14_poll_loop_survives_denied_calls(self):
         b = self.bridge()
@@ -533,7 +581,7 @@ class AllowedPaths(Base):
             t.start()
         try:
             for i in range(25):
-                b.tg.send_service(7, op.ChatId(i))
+                b.tg.send_service(op.ChatId(i))
         finally:
             stop.set()
             for t in threads:
@@ -581,6 +629,65 @@ class PendingQueueRestart(Base):
                 self.assertEqual(snapshot(self.state), before, "mtime/location/inode changed")
                 self.assertEqual(self.rec.calls, [], "nothing may be sent or even polled")
 
+    def refuses(self, **kw):
+        b = self.bridge(**kw)
+        before = snapshot(self.state)
+        b._stop.set()
+        with self.assertRaises(op.OutboundQueuePresent):
+            b._run_locked()
+        self.assertEqual(snapshot(self.state), before)
+        self.assertEqual(self.rec.calls, [])
+
+    def test_non_regular_entries_count_as_pending_and_are_never_followed(self):
+        out = self.state / "queue" / "outbox"
+        out.mkdir(parents=True)
+        target = self.root / "elsewhere.json"
+        target.write_text("{}")
+        os.symlink(target, out / "link.json")             # symlink to an existing file
+        self.refuses()
+        (out / "link.json").unlink()
+        os.symlink(self.root / "missing", out / "dangling.json")
+        self.refuses()
+        (out / "dangling.json").unlink()
+        os.mkfifo(out / "pipe.json")                      # opening it would block forever
+        self.refuses()
+        (out / "pipe.json").unlink()
+        (out / "subdir").mkdir()
+        self.refuses()
+        (out / "subdir").rmdir()
+        out.rmdir()
+        os.symlink(self.root, self.state / "queue" / "outbox")   # the outbox itself is a symlink
+        self.refuses()
+
+    def test_unreadable_outbox_counts_as_pending(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores permissions")
+        out = self.state / "queue" / "outbox"
+        out.mkdir(parents=True)
+        out.chmod(0)
+        try:
+            self.refuses()
+        finally:
+            out.chmod(0o700)
+
+    def test_legacy_queue_symlink_or_fifo_counts_and_is_not_opened(self):
+        legacy = self.state / "outbound_queue_t.jsonl"
+        os.symlink(self.root / "nowhere", legacy)
+        self.refuses()
+        legacy.unlink()
+        os.mkfifo(legacy)
+        self.refuses()
+
+    def test_legacy_path_is_derived_from_config_without_signal_file(self):
+        (self.state / "outbound_queue_t.jsonl").write_text(json.dumps({"text": "old"}) + "\n")
+        b = self.bridge(signal_file="")
+        self.assertIsNone(b._queue_path)
+        before = snapshot(self.state)
+        b._stop.set()
+        with self.assertRaises(op.OutboundQueuePresent):
+            b._run_locked()
+        self.assertEqual(snapshot(self.state), before)
+
     def test_run_exits_with_distinct_code_and_doctor_still_works(self):
         from agent2telegram.__main__ import _cmd_run
         self.seed("durable")
@@ -612,10 +719,12 @@ class StaticAudit(unittest.TestCase):
     def test_no_free_text_entry_point_and_known_callers(self):
         import inspect
         sig = inspect.signature(op.OutboundGuard.send_service)
-        self.assertEqual(list(sig.parameters), ["self", "chat_id", "reply"])
+        self.assertEqual(list(sig.parameters), ["self", "reply"])
+        for cls in (op.ChatId, op.NotAuthorized, op.InjectFailed, op.RestartNotice, op.Status):
+            self.assertEqual(list(cls.__dataclass_fields__)[0], "chat_id")
         src = Path(attach_mod.__file__).read_text()
-        self.assertEqual(src.count("send_service("), src.count("send_service(chat_id, typed)")
-                         + src.count("send_service(chat_id, op.") + src.count("send_service(self._owner_chat, op."))
+        self.assertEqual(src.count("send_service("), src.count("send_service(typed)")
+                         + src.count("send_service(op."))
 
 
 if __name__ == "__main__":

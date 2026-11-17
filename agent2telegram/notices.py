@@ -66,7 +66,7 @@ def restart_notice(bridge, chat_id):
             text = cfg.restart_notice_text or default_restart_text(cfg.language)
             if getattr(bridge, '_explicit_only', False):
                 from .outbound_policy import RestartNotice
-                bridge.tg.send_service(chat_id, RestartNotice(cfg.language))
+                bridge.tg.send_service(RestartNotice(chat_id, cfg.language))
             else:
                 bridge.tg.send_message(chat_id, text)
             log.info('startup notice sent')

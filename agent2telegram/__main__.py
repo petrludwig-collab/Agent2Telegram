@@ -148,8 +148,10 @@ def _cmd_notify(args) -> int:
 
 
 def _cmd_doctor(args) -> int:
+    import json
     import os
-    from .config import load, ConfigError
+    from pathlib import Path
+    from .config import Config, load, ConfigError
     from . import adapters
     if getattr(args, 'config', None):
         os.environ['AGENT2TELEGRAM_CONFIG'] = args.config
@@ -160,7 +162,17 @@ def _cmd_doctor(args) -> int:
         return 2
     print("config:", cfg.redacted())
     print("outbound_policy: explicit-only supported (v1); explicit_only_outbound="
-          f"{cfg.explicit_only_outbound}")
+          f"{cfg.explicit_only_outbound}; "
+          + ("ACTIVE" if cfg.explicit_only_outbound is True else "INACTIVE")
+          + " for this config")
+    try:                                    # a typo in the key itself would leave it INACTIVE
+        from .config import config_path
+        raw = json.loads(Path(config_path()).read_text("utf-8"))
+        extra = sorted(str(k) for k in raw if k not in Config.__dataclass_fields__)
+        if extra:
+            print("⚠️  unknown config keys are ignored in default mode: " + ", ".join(extra))
+    except Exception:
+        pass
     cls = adapters.REGISTRY.get(cfg.agent)
     if cls is None:
         print(f"✗ unknown agent '{cfg.agent}'")

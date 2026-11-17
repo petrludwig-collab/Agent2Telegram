@@ -329,7 +329,9 @@ class AttachBridge:
         # here and re-sent by the outbound loop until Telegram confirms — so a turn's answer is
         # NEVER silently lost. Survives restarts (re-loaded below). Per-bridge (tmux slug).
         self._queue_path = (self._signal.parent / f"outbound_queue_{_slug}.jsonl") if self._signal else None
-        self._pending_send: list = self._load_queue()
+        # Explicit-only never reads the legacy queue (opening a fifo there would block the
+        # constructor); the start preflight inspects it without opening anything unsafe.
+        self._pending_send: list = [] if self._explicit_only else self._load_queue()
         self._tpos = 0
         self._turn_active = threading.Event()
         self._turn_from_tg = False           # is the current transcript turn Telegram-originated?
@@ -869,7 +871,7 @@ class AttachBridge:
         """A fixed bridge reply. Default mode: exactly the old call. Explicit-only: the typed
         ServiceReply (text built from a fixed template) through the guard's single door."""
         if self._explicit_only:
-            self.tg.send_service(chat_id, typed)
+            self.tg.send_service(typed)
         else:
             self.tg.send_message(chat_id, text, **kw)
 
@@ -878,8 +880,12 @@ class AttachBridge:
         Raw read-only scan, BEFORE any DurableOutbox is constructed (its maintenance moves
         files). Nothing is sent, moved or deleted."""
         queue_path = getattr(self, "_queue_path", None)
-        root = (Path(queue_path).parent if queue_path is not None else _state_dir(self.cfg)) / "queue"
-        found = op.scan_queues(root, queue_path)
+        base = Path(queue_path).parent if queue_path is not None else _state_dir(self.cfg)
+        if queue_path is None:          # derive the legacy file deterministically from the config
+            slug = "".join(c if (c.isalnum() or c in "._-") else "_"
+                           for c in (self.cfg.tmux_session or "bridge"))
+            queue_path = base / f"outbound_queue_{slug}.jsonl"
+        found = op.scan_queues(base / "queue", queue_path)
         if found:
             raise op.OutboundQueuePresent(
                 f"explicit-only outbound refuses to start: {len(found)} pending outbound queue "
@@ -1414,7 +1420,7 @@ class AttachBridge:
         user_id = msg.get("from", {}).get("id")
         chat_id = msg["chat"]["id"]
         if user_id not in self._allowed:
-            self._reply(chat_id, "⛔ Not authorized.", op.NotAuthorized())
+            self._reply(chat_id, "⛔ Not authorized.", op.NotAuthorized(chat_id))
             return True
         chat_type = (msg.get("chat") or {}).get("type")
         in_group = chat_type in ("group", "supergroup")
@@ -1425,7 +1431,7 @@ class AttachBridge:
                 return True                      # foreign group: silent, never routed
         elif user_id in (getattr(self.cfg, "group_only_user_ids", []) or []):
             self._reply(chat_id, "⛔ Not authorized here – please use the shared group.",
-                        op.NotAuthorizedHere())
+                        op.NotAuthorizedHere(chat_id))
             return True
 
         from .mentions import accepts_message
@@ -1679,7 +1685,7 @@ class AttachBridge:
             return
         if self._explicit_only:
             try:
-                self.tg.send_service(self._owner_chat, op.InjectFailed(INJECT_ATTEMPTS))
+                self.tg.send_service(op.InjectFailed(self._owner_chat, INJECT_ATTEMPTS))
             except Exception as e:
                 log.warning("inject-failure notification failed: error=%s", type(e).__name__)
             return
@@ -1711,7 +1717,7 @@ class AttachBridge:
         self._last_pane_warning = now
         try:
             if self._explicit_only:
-                self.tg.send_service(self._owner_chat, op.UnsafePane())
+                self.tg.send_service(op.UnsafePane(self._owner_chat))
                 return
             self.tg.send_message(
                 self._owner_chat,
@@ -1730,13 +1736,13 @@ class AttachBridge:
         labels = {"codex": "Codex", "claude-code": "Claude Code"}
         agent = labels.get(self.cfg.agent, self.cfg.agent)
         if self._explicit_only:
-            typed = {"start": op.Help(), "help": op.Help(), "id": op.ChatId(chat_id),
-                     "status": op.Status(self.cfg.agent),
-                     "setkey": op.NotAvailableExplicitOnly(),   # would need deleteMessage
-                     "voice": op.NotAvailableExplicitOnly()}.get(cmd)
+            typed = {"start": op.Help(chat_id), "help": op.Help(chat_id), "id": op.ChatId(chat_id),
+                     "status": op.Status(chat_id, self.cfg.agent),
+                     "setkey": op.NotAvailableExplicitOnly(chat_id),   # would need deleteMessage
+                     "voice": op.NotAvailableExplicitOnly(chat_id)}.get(cmd)
             if typed is None:
                 return False            # unknown command → agent, as before
-            self.tg.send_service(chat_id, typed)
+            self.tg.send_service(typed)
             return True
         if cmd in ("start", "help"):
             voice = "on" if self.cfg.elevenlabs_api_key else "off — enable with /setkey"
@@ -2661,7 +2667,7 @@ class AttachBridge:
             chat_id,
             f"🎤 That audio is ~{mb} MB. Voice/audio limit is 25 MB — "
             "please send a shorter clip or write it as text.",
-            op.AudioTooLarge(mb),
+            op.AudioTooLarge(chat_id, mb),
         )
 
     def _limit_inbound_prompt(self, text: str, chat_id: int) -> str | None:
@@ -2671,7 +2677,7 @@ class AttachBridge:
             chat_id,
             f"⚠️ That message is too long after processing ({len(text)} characters). "
             f"Please shorten it to {MAX_INBOUND_PROMPT_CHARS} characters or less.",
-            op.PromptTooLong(len(text), MAX_INBOUND_PROMPT_CHARS),
+            op.PromptTooLong(chat_id, len(text), MAX_INBOUND_PROMPT_CHARS),
         )
         log.warning("inbound prompt too long: %d characters", len(text))
         return None
@@ -2682,7 +2688,7 @@ class AttachBridge:
             self._reply(chat_id,
                 "🎤 Voice transcription isn't enabled yet. Add your ElevenLabs key with "
                 "`/setkey <your-key>` (I'll delete the message right after) — then resend the voice note.",
-                op.SttNotEnabled())
+                op.SttNotEnabled(chat_id))
             return None
         try:
             size = int(media.get("file_size") or 0)
@@ -2706,7 +2712,7 @@ class AttachBridge:
             # Silent or accidentally sent note: the user's side, not a bridge fault.
             log.warning("voice note had no speech")
             if self._explicit_only:
-                self.tg.send_service(chat_id, op.SttNoSpeech())
+                self.tg.send_service(op.SttNoSpeech(chat_id))
                 return None
             self._send_final(
                 "🎤 I couldn't hear any speech in that voice note. Please record it again.",
@@ -2716,7 +2722,7 @@ class AttachBridge:
         except Exception as e:
             log.error("transcription failed: %s", e)
             if self._explicit_only:
-                self.tg.send_service(chat_id, op.SttFailed())
+                self.tg.send_service(op.SttFailed(chat_id))
                 return None
             # This is an inbound voice-note failure, not agent output for the current turn.
             self._send_final(
@@ -2741,7 +2747,7 @@ class AttachBridge:
             self._reply(chat_id,
                 f"⚠️ That file is ~{size // 1024 // 1024} MB. Telegram bots can only receive files up "
                 "to 20 MB — please share a link (Drive/Dropbox) or a smaller/zipped version.",
-                op.FileTooBig(size // 1024 // 1024))
+                op.FileTooBig(chat_id, size // 1024 // 1024))
             log.warning("attachment '%s' too big for the Bot API: %s bytes", default, size)
             return ""
         try:
@@ -2751,7 +2757,7 @@ class AttachBridge:
             log.warning("attachment '%s' download failed: %s", default, e)
             self._reply(chat_id,
                 "⚠️ Couldn't download the attachment (too large, or a transient error — try again).",
-                op.DownloadFailed())
+                op.DownloadFailed(chat_id))
             return ""
         name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(default).name) or "file"
         if "." not in name and (ext := Path(fp).suffix):

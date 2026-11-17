@@ -274,10 +274,14 @@ still reach the agent. State-revealing replies (queued/busy acknowledgments) are
 
 - The config is strict: a wrong type, a mode other than `attach`, `background_progress`,
   `group_marker`, `restart_notice_text`, or any unknown key is rejected before anything runs.
-  Older versions ignore the key, so check `agent2telegram doctor` (it prints
-  `outbound_policy: explicit-only supported`) before relying on it.
+  A mistyped key name, or an older version, silently leaves the feature OFF (default mode ignores
+  unknown keys). Integrators must verify that `agent2telegram doctor` prints
+  `explicit-only supported ...; ACTIVE for this config` (not `INACTIVE`) before relying on it;
+  doctor also names unknown keys it ignored.
 - If an outbound queue from an earlier run is still present (`<state>/queue/outbox/*`,
   `outbound_queue_<session>.jsonl`), `run` refuses to start (exit code 3) and leaves it untouched.
+  Any non-regular entry there (symlink, fifo, directory, unreadable) counts as pending and is
+  never followed or opened.
   Drain it under default mode or move it aside yourself.
 - Threat model: the guard protects against the bridge's own passive paths. Code running inside the
   bridge process (a subclass, raw `urllib`, a client reference kept by the caller) is trusted,
