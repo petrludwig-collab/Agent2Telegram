@@ -1557,6 +1557,35 @@ class SendGateTests(RigTestCase):
         safe.assert_not_called()
 
 
+class RouteLifecycleTests(RigTestCase):
+    def test_terminal_text_before_a_queued_report_prompt_keeps_the_pending_route(self):
+        r = self.rig
+        r.tg_turn(OWNER)
+        r.launch("t1")
+        r.end_turn()
+        r.terminal("busy")
+        r.notify("t1")
+        r.end_turn()                                                   # report typed, not consumed
+        report_prompt = r.typed[-1]
+        r.terminal("typed while the report prompt was queued")
+        self.assertEqual(r.bridge._route.kind, "pending")
+        self.assertEqual(r.job("t1"), "claimed")
+        r.submit(report_prompt)
+        self.assertEqual(r.bridge._route.kind, "notif")
+        r.say("[tg] result")
+        r.end_turn()
+        self.assertEqual(r.sent_to(OWNER)[-1], "result")
+
+    def test_a_normal_turn_end_releases_the_route_by_itself(self):
+        r = self.rig
+        r.tg_turn(OWNER)
+        r.bridge._n1_tick = lambda: None                               # nothing else may rescue the release
+        r.stop()
+        r.bridge._end_turn(from_hook=True)
+        self.assertEqual(r.bridge._route.kind, "none")
+        self.assertFalse(r.bridge._turn_from_tg)
+
+
 class StateFileTests(unittest.TestCase):
     def test_schema_validation_rejects_bad_files(self):
         import tempfile
