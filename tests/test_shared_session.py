@@ -1755,7 +1755,11 @@ class RecipientAndUncertainTests(RigTestCase):
             r.submit()                                                 # the harness already recorded it
             raise RuntimeError("the call reported a failure after the keys were typed")
         r.bridge._session.inject = typed_consumed_then_raises
+        kinds = []
+        real_report = r.bridge._n1_report
+        r.bridge._n1_report = lambda claim: (real_report(claim), kinds.append(r.bridge._route.kind))[0]
         r.end_turn()
+        self.assertEqual(kinds, ["none"], "the report worker itself leaves the route (no later tick needed)")
         self.assertEqual(r.job("t1"), "uncertain")
         self.assertEqual(r.bridge._route.kind, "none")
         r.say("[tg] output after the uncertain result")
