@@ -1058,6 +1058,22 @@ class TurnScopedRecipientTests(RigTestCase):
         self.assertEqual(r.bridge._owner_chat, GROUP)
         self.assertEqual(r.sent_to(GROUP), [])
 
+    def test_same_chat_inbound_does_not_join_a_claimed_result_turn(self):
+        r = self.rig
+        self.prepare_a()
+        r.notify("tA")                                                 # idle claim: A's result turn is running
+        typed = len(r.typed)
+        with patch("agent2telegram.attach.CHAT_SWITCH_POLL", 0.01):
+            t, done = self.inbound_in_thread(OWNER)
+            self.assertFalse(done.wait(0.3), "queued behind the result turn, even for the same chat")
+            self.assertEqual(len(r.typed), typed)
+            r.say("[tg] result A")
+            r.stop()
+            r.bridge._end_turn(from_hook=True)
+            self.assertTrue(done.wait(5))
+            t.join(5)
+        self.assertEqual(len(r.typed), typed + 1)
+
     def test_inbound_during_a_reserved_report_turn_is_queued(self):
         r = self.rig
         self.prepare_a()
@@ -1176,6 +1192,17 @@ class RevocationRoutingTests(RigTestCase):
         r.tick()
         self.assertEqual(r.client.sent, [])
         self.assertFalse(r.bridge._turn_from_tg)
+
+    def test_store_degraded_without_any_record_still_clears_the_routing(self):
+        r = self.rig
+        r.tg_turn(OWNER)
+        tmp = break_writes(r)
+        self.addCleanup(lambda: tmp.exists() and tmp.rmdir())
+        r.tg(OWNER, "refused, and the store becomes degraded")
+        self.assertIsNotNone(r.n1.degraded)
+        r.tick()
+        self.assertFalse(r.bridge._turn_from_tg)
+        self.assertIsNone(r.bridge._n1_turn_chat)
 
     def test_zero_width_characters_at_the_edges_do_not_break_consumption(self):
         r = self.rig
