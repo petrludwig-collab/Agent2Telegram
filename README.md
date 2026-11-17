@@ -259,6 +259,44 @@ before a bare `--to-group`, or pipe it on stdin, so it cannot be mistaken for an
 `--file` is repeatable and enforces the same outbox allowlist as chat attachments.
 Notification routing logs contain the destination ID, without the message text.
 
+### Retry-safe notifications: `--key` and `notify-status`
+
+A cron job or script that repeats `notify` after a timeout can send the message twice, because a
+timeout does not tell whether Telegram already accepted it. Give the call an idempotency key:
+
+```bash
+python3 -m agent2telegram notify --key nightly-backup-2026-11-17 "backup finished ✅"
+python3 -m agent2telegram notify-status nightly-backup-2026-11-17          # or --json
+```
+
+A repeated call with the same key and the same text and target sends nothing again. Text only:
+`--key` together with `--file` is refused before anything is sent. Without `--key`, `notify`
+behaves exactly as before.
+
+| exit | meaning |
+|---|---|
+| 0 | delivered (every part got a `message_id`), or already delivered by an earlier call |
+| 1 | not delivered, for certain: Telegram sent a well-formed 4xx error (a flood-control 429 included, with its retry-after in the message). A rerun may send |
+| 2 | usage, config or ledger error; nothing was sent |
+| 3 | collision: the key was used for a different text or target; nothing was sent |
+| 4 | uncertain: the message may or may not have arrived (timeout or network error after the request, a 5xx answer, only some parts sent, crashed sender). It is never resent automatically |
+| 5 | another process is sending under this key right now; nothing was sent |
+
+A keyed send writes its intent to a small ledger in the state directory (`notify-keys/`) before
+the first request and uses no internal retry and no flood-control wait. The plain-text fallback is used
+only when Telegram refused the formatting itself ("can't parse entities"); any other answer that is not
+a well-formed Telegram error, such as an empty or odd body, counts as uncertain. There is no force option: after an
+`uncertain` result, check the chat, then use a new key or wait for the window to end. The key is a
+bounded dedup window (`--key-ttl SECONDS`, positive, at most 10 years, default 7 days, fixed when the key is
+first used and kept when a `failed` send is retried), not a
+permanent identity. Expired records are removed by later `notify --key` calls only.
+Keys are kept per bot (by the numeric bot id of the configured token), so two bots sharing a state
+directory never see each other's keys. `notify-status` only reads: it creates, locks and removes nothing. It prints `delivered`, `failed`,
+`uncertain`, `sending` (in flight or interrupted: treat as uncertain) or `unknown`. The ledger stores
+a hash of the text and target, not the text. A ledger record that is damaged or has unexpected field
+types blocks sending (`uncertain`) and shows as such in `notify-status`; remove the file to start over.
+POSIX only (it uses `flock`).
+
 ---
 
 ## Voice messages (optional)

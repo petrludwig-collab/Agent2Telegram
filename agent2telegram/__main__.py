@@ -73,6 +73,14 @@ def _cmd_notify(args) -> int:
     this instead."""
     import os
     from .config import load, ConfigError
+    # isinstance: callers that build a bare namespace/mock without the new options stay on the old path
+    key = args.key if isinstance(getattr(args, "key", None), str) else None
+    key_ttl = args.key_ttl if isinstance(getattr(args, "key_ttl", None), (int, float)) else None
+    if key is not None or key_ttl is not None:
+        bad = _keyed_usage_error(args, key, key_ttl)
+        if bad:
+            print(f"✗ {bad}", file=sys.stderr)
+            return 2
     if getattr(args, "config", None):
         os.environ["AGENT2TELEGRAM_CONFIG"] = args.config
     try:
@@ -107,6 +115,8 @@ def _cmd_notify(args) -> int:
     from pathlib import Path
     client = TelegramClient(cfg.token)
     logging.getLogger("agent2telegram.notify").info("notify target chat=%s", target)
+    if key is not None:
+        return _notify_keyed(cfg, client, key, target, text, key_ttl)
     try:
         if text:
             client.send_message(target, text)
@@ -140,6 +150,90 @@ def _cmd_notify(args) -> int:
             print(f"✗ {path.name}: {e}", file=sys.stderr)
             rc = 1
     return rc
+
+
+def _keyed_usage_error(args, key, key_ttl) -> str | None:
+    """Reject unsupported ``--key`` combinations before anything is sent (v1 is text only)."""
+    from . import notify_ledger
+    if key is None:
+        return "--key-ttl needs --key"
+    if getattr(args, "file", None):
+        return "--key supports text only; do not combine it with --file"
+    if not notify_ledger.available():
+        return "--key needs a POSIX system (file locking)"
+    if key_ttl is not None and not 0 < key_ttl <= notify_ledger.MAX_TTL:   # also false for nan
+        return "--key-ttl must be a positive number of seconds, at most 10 years (315360000)"
+    try:
+        notify_ledger.check_key(key)
+    except notify_ledger.InvalidKey as e:
+        return str(e)
+    return None
+
+
+def _notify_keyed(cfg, client, key, target, text, ttl) -> int:
+    from . import notify_ledger as ledger
+    from .config import _state_dir
+    bot = ledger.bot_id(cfg.token)
+    if bot is None:
+        print("✗ cannot derive the bot id from the token (expected '<digits>:...'); nothing was sent",
+              file=sys.stderr)
+        return 2
+    try:
+        res = ledger.notify_keyed(client, _state_dir(cfg) / "notify-keys", bot, key, target, text,
+                                  ttl=ttl or ledger.DEFAULT_TTL)
+    except ValueError as e:              # bad arguments, rejected before anything was recorded
+        print(f"✗ invalid notify --key arguments: {e}; nothing was sent", file=sys.stderr)
+        return 2
+    except OSError as e:   # raised only before the intent is durable, i.e. before any request
+        print(f"✗ notify key ledger unavailable ({e.__class__.__name__}); nothing was sent", file=sys.stderr)
+        return 2
+    ids = ", ".join(str(i) for i in (res["record"] or {}).get("message_ids", []))
+    if res["exit_code"] == ledger.EXIT_OK:
+        print(f"✓ {res['message']}" + (f" (message_id {ids})" if ids else ""))
+    else:
+        print(f"✗ {res['state']}: {res['message']}", file=sys.stderr)
+    return res["exit_code"]
+
+
+def _cmd_notify_status(args) -> int:
+    """Report what the key ledger knows about KEY. Strictly read-only."""
+    import json
+    import os
+    from datetime import datetime, timezone
+    from . import notify_ledger as ledger
+    from .config import load, ConfigError, _state_dir
+    if getattr(args, "config", None):
+        os.environ["AGENT2TELEGRAM_CONFIG"] = args.config
+    try:
+        ledger.check_key(args.key)
+        cfg = load()
+    except (ledger.InvalidKey, ConfigError) as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    bot = ledger.bot_id(cfg.token)
+    if bot is None:
+        print("✗ cannot derive the bot id from the token (expected '<digits>:...')", file=sys.stderr)
+        return 2
+    out = ledger.read_status(_state_dir(cfg) / "notify-keys", bot, args.key)
+    if args.json:
+        print(json.dumps(out, sort_keys=True))
+        return 0
+    print(f"key: {out['key']}\nstate: {out['state']}")
+    for name in ("message_ids", "created_at", "expires_at"):
+        if out.get(name):
+            val = out[name]
+            if name.endswith("_at"):
+                try:
+                    val = datetime.fromtimestamp(val, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                except (OverflowError, OSError, ValueError):
+                    pass                                 # absurd timestamp in a damaged record: show it raw
+            print(f"{name}: {val}")
+    if out.get("expired"):
+        print("expired: yes (a new send under this key is allowed)")
+    for name in ("detail", "note"):
+        if out.get(name):
+            print(f"{name}: {out[name]}")
+    return 0
 
 
 def _cmd_doctor(args) -> int:
@@ -320,6 +414,14 @@ def _main(argv: list[str] | None = None) -> int:
                     help="send to an allowed group; omit GROUP_ID only when exactly one is configured")
     nt.add_argument("--file", action="append",
                     help="attach a file from an outbox folder (repeatable)")
+    nt.add_argument("--key", help="idempotency key: a repeated call with the same key and text sends nothing "
+                                  "again (text only; see README)")
+    nt.add_argument("--key-ttl", type=float, metavar="SECONDS",
+                    help="dedup window for a new --key (default: 7 days)")
+    ns = sub.add_parser("notify-status", help="show the delivery state recorded for a notify --key (read-only)")
+    ns.add_argument("key", help="the key given to notify --key")
+    ns.add_argument("--json", action="store_true", help="machine-readable output")
+    ns.add_argument("--config", help="path to a specific bridge config")
     sub.add_parser("service", help="print a systemd/launchd service unit")
     doctor = sub.add_parser("doctor", help="diagnose config and agent availability")
     doctor.add_argument('--config', help='path to a specific bridge config')
@@ -351,6 +453,8 @@ def _main(argv: list[str] | None = None) -> int:
         return _cmd_run(args)
     if args.command == "notify":
         return _cmd_notify(args)
+    if args.command == "notify-status":
+        return _cmd_notify_status(args)
     if args.command == "service":
         from . import service
         return service.print_instructions()
