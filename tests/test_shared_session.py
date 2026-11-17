@@ -1741,6 +1741,27 @@ class RecipientAndUncertainTests(RigTestCase):
         r.tick()
         self.assertEqual(r.sent_to(OWNER), [])
 
+    def test_report_injection_that_fails_after_its_envelope_was_consumed_leaves_the_route(self):
+        r = self.rig
+        r.tg_turn(OWNER)
+        r.launch("t1")
+        r.end_turn()
+        r.terminal("busy")
+        r.notify("t1")
+        real = r.bridge._session.inject
+
+        def typed_consumed_then_raises(*a, **k):
+            real(*a, **k)
+            r.submit()                                                 # the harness already recorded it
+            raise RuntimeError("the call reported a failure after the keys were typed")
+        r.bridge._session.inject = typed_consumed_then_raises
+        r.end_turn()
+        self.assertEqual(r.job("t1"), "uncertain")
+        self.assertEqual(r.bridge._route.kind, "none")
+        r.say("[tg] output after the uncertain result")
+        r.tick()
+        self.assertEqual(r.sent_to(OWNER), [])
+
     def test_the_bridge_leaves_the_route_when_the_job_is_no_longer_claimed(self):
         r = self.rig
         self.consumed_report()
