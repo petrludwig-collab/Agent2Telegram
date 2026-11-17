@@ -309,7 +309,7 @@ class TmuxSession:
     def _pane_ok(self) -> tuple[bool, str]:
         return _agent_alive(self.name, getattr(self, "_expected_agent_commands", ()))
 
-    def _send_keys(self, text: str) -> None:
+    def _send_keys(self, text: str, nonce: str | None = None) -> None:
         ok, detail = self._pane_ok()
         if not ok:
             # Fail closed: if the agent has crashed back to a shell, Enter would execute the
@@ -321,6 +321,11 @@ class TmuxSession:
         if self._origin:
             text = f"{self._origin}{text}"
         text = sanitize_for_tmux(text)
+        if nonce:
+            # Shared-session correlation: the envelope wraps the WHOLE prompt, origin prefix included,
+            # and is added after the length cap so it can never be cut in half.
+            from .shared_session import wrap_prompt
+            text = wrap_prompt(nonce, text)
         _tmux("send-keys", "-t", self.name, "C-u"); time.sleep(0.05)
         if len(text.encode("utf-8")) > PASTE_MIN_BYTES:
             self._paste(text); time.sleep(0.3)
@@ -383,12 +388,15 @@ class TmuxSession:
     def _capture(self) -> str:
         return _tmux("capture-pane", "-p", "-t", self.name, check=False).stdout
 
-    def inject(self, text: str) -> None:
+    def inject(self, text: str, *, nonce: str | None = None) -> None:
         """Fire-and-forget: type the message into the session, don't wait for a reply.
         Used by the async attach bridge (outbound is handled separately)."""
         if not self.alive:
             raise SessionError(f"agent session '{self.name}' is gone")
-        self._send_keys(text)
+        if nonce:
+            self._send_keys(text, nonce)
+        else:
+            self._send_keys(text)
 
     def send(self, text: str) -> str:
         if not self.alive:

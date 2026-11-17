@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Opt-in `shared_session_delivery` (default off, byte-identical when off): the result of a background
+  task started from a Telegram message is delivered once to that chat, while the same session stays
+  usable over SSH/tmux. A one-time envelope around the whole injected prompt and one atomic state file
+  correlate the Telegram turn, the launched task and its completion; terminal input never inherits a
+  Telegram origin; at-most-once delivery; a prompt whose correlation cannot be stored is not injected.
+  Operational correlation only, not protection against someone with the same account.
 - Attach mode defaults to `group_interim: false`: group destinations receive the final
   answer and allowed attachments, with narration, tool/status bubbles, background progress,
   typing and queued-message acknowledgments suppressed. Private-chat progress is unchanged;

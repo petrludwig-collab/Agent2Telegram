@@ -369,6 +369,28 @@ is shown for history replayed at startup. `"background_edit_interval"` (seconds,
 throttles edits; `"background_stale_after"` (default 300) drops progress that went silent. The
 labels follow `"language"`. The default is off.
 
+Background results in a shared session (attach mode, Claude Code): `"shared_session_delivery": true`
+delivers the result of a background task that a Telegram message started to THAT chat, while the same
+session stays fully usable over SSH/tmux. It needs `"mode": "attach"`, the `claude-code` agent,
+`"reply_to_origin_chat": true`, a `signal_file` and the Stop hook; a group counts only when it is listed
+in `"allowed_group_ids"`. The default is off, and when off nothing changes (no envelope, no state file).
+How it works: the bridge wraps the WHOLE prompt it types into one one-time envelope
+(`<a2t:N>...</a2t:N>`, N = 128 random bits) and stores N before typing it. The first `human` transcript
+record that is exactly that envelope makes the turn a Telegram turn; background tasks started inside
+that turn are bound to the chat; the completion (a `task-notification` record) is delivered once, only
+when nothing else is running and the chat is still authorised. Terminal input never joins a Telegram
+turn, never inherits its origin, and never changes the recipient of a task that is already bound; a
+completion that arrives during another turn is deferred and delivered afterwards (the agent is asked
+by a fixed prompt to report the finished task). If the state cannot be stored, the Telegram message is
+NOT typed into the session and the chat gets a fixed error; the terminal is never affected. Delivery is
+at-most-once: after a crash mid-delivery the task is marked `uncertain` and is not retried.
+`"shared_session_nonce_ttl"` (seconds, default 600) limits the time from typing a prompt to its
+appearance in the transcript; `"shared_session_job_ttl"` (default 86400) limits how long a bound task
+stays deliverable. State lives in one file next to the signal file (`shared_session_<tmux>.json`).
+This is an operational correlation, not a security boundary: anyone who can already read or write the
+same account, tmux, transcript or state file can forge the envelope or the state. It is also checked
+only against synthetic transcripts, not against a live Claude Code session.
+
 ---
 
 ## Run it forever (boot + auto‑restart)

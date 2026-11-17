@@ -32,6 +32,7 @@ from pathlib import Path
 
 from . import adapters
 from . import readers
+from . import shared_session as shared
 from .background import SubagentWatcher, _epoch as _record_wall_time
 from . import tts
 from .compat import AlreadyRunning, single_instance_lock
@@ -265,10 +266,21 @@ class AttachBridge:
     #: Durable outbox with per-part confirmation. Off by default for objects built without
     #: __init__ (focused tests), which have no queue path to write to.
     _use_durable_outbox = True
+    # Shared-session (N1) delivery of background results. Class-level defaults so objects built
+    # without __init__ (focused tests) behave as "feature off".
+    _n1 = None                  # shared_session.SharedSession, None = off (the default)
+    _n1_gate = None             # RLock: a claim never overlaps an inbound message being handled
+    _n1_inflight = 0            # inbound messages being handled right now
+    _n1_prev_owner = None       # _owner_chat before a claimed turn borrowed the job's chat
+    _n1_notif_active = False    # a claimed (background-result) turn owns _owner_chat
+    _n1_last_rec = 0.0          # monotonic ts of the last transcript content (idle fallback)
+    _n1_run = None              # how the report prompt is started (a thread); tests run it inline
 
     def __init__(self, cfg: Config, *, client: TelegramClient | None = None) -> None:
         if not cfg.tmux_session:
             raise ValueError("attach mode requires 'tmux_session' in config")
+        if getattr(cfg, "shared_session_delivery", False) is True:
+            shared.validate_config(cfg)          # an unusable configuration is refused before any effect
         self.cfg = cfg
         self.tg = client or TelegramClient(cfg.token)
         self._reaction_seen: dict = {}   # (chat, msg, emoji) -> first reaction timestamp
@@ -338,6 +350,14 @@ class AttachBridge:
         self._status_path = (self._signal.parent / "status_bubble") if self._signal else None
         # Same for the background progress message (per bridge, like the heartbeat).
         self._bg_state_path = (self._signal.parent / f"background_progress_{_slug}") if self._signal else None
+        if getattr(cfg, "shared_session_delivery", False) is True:
+            self._n1_gate = threading.RLock()
+            self._n1 = shared.SharedSession(
+                self._signal.parent / f"shared_session_{_slug}.json",
+                nonce_ttl=cfg.shared_session_nonce_ttl, job_ttl=cfg.shared_session_job_ttl,
+                authorised=self._n1_chat_authorised, busy=self._n1_busy)
+            self._n1.load()
+            self._reader = shared.EnvelopeReader(self._reader)
         self._seen_tools: set = set()
         self._tui_seen: set = set()          # Codex TUI scrape: tool lines already shown this turn
         self._turn_text_sent = False         # has any text been forwarded this turn (bubble gate)
@@ -623,7 +643,9 @@ class AttachBridge:
         # of the current turn so a reply written while we were restarting still gets forwarded —
         # the ledger dedups, so nothing already delivered is re-sent. On the very first run we do
         # NOT rewind, so attaching to an already-busy session never re-posts its prior turn.
-        if self._transcript and self._transcript.exists():
+        if self._n1 is not None:
+            self._n1_startup()
+        elif self._transcript and self._transcript.exists():
             self._tpos = self._transcript.stat().st_size
             if self._sent_keys:
                 self._resume_position()
@@ -1309,6 +1331,17 @@ class AttachBridge:
                     log.error("inbound error: error=%s %s", type(e).__name__, update_metadata(upd))
 
     def _handle(self, upd: dict) -> bool:
+        if self._n1 is None:
+            return self._handle_update(upd)
+        with self._n1_gate:                      # a claim never starts while a message is being handled
+            self._n1_inflight += 1
+        try:
+            return self._handle_update(upd)
+        finally:
+            with self._n1_gate:
+                self._n1_inflight -= 1
+
+    def _handle_update(self, upd: dict) -> bool:
         """Handle one update. Returns False ONLY when the message was not delivered to the session.
 
         The return value drives the durable inbox: True = handled, the record may go; False = not
@@ -1554,7 +1587,9 @@ class AttachBridge:
         self._turn_input_boundary = (path, size, time.time())
         now = time.monotonic()
         self._turn_active.set()
-        self._turn_from_tg = True
+        # Shared session (N1): the turn becomes Telegram's only when its envelope is consumed in
+        # the transcript (or a claimed result opens it) - never merely because we typed it.
+        self._turn_from_tg = self._n1 is None
         self._last_activity = now
         self._turn_started = now
         self._turn_started_wall = time.time()   # records are stamped with wall-clock time
@@ -1592,7 +1627,7 @@ class AttachBridge:
             self._typing_count = 1
         log.info("TURN START t=%.2f", time.time())
 
-    def _inject(self, text: str) -> bool:
+    def _inject(self, text: str, *, nonce: str | None = None, notify: bool = True) -> bool:
         """Deliver a message to the session. A failure must NEVER be silent.
 
         Previously a failed write to tmux was only logged and the message vanished — the user
@@ -1605,10 +1640,16 @@ class AttachBridge:
         """
         self._turn_active.set()
         self._last_activity = time.monotonic()   # keep typing lit from the very start
+        if self._n1 is not None and nonce is None:
+            try:
+                nonce = self._n1.issue(self._owner_chat)     # stored BEFORE anything is typed (R8)
+            except shared.StateError:
+                return self._n1_refuse()
+        extra = {"nonce": nonce} if nonce else {}
         last_error: Exception | None = None
         for attempt in range(1, INJECT_ATTEMPTS + 1):
             try:
-                self._session.inject(text)
+                self._session.inject(text, **extra)
                 if attempt > 1:
                     log.info("inject succeeded on attempt %d", attempt)
                 return True
@@ -1618,7 +1659,10 @@ class AttachBridge:
                     # The pane isn't running the expected agent — retrying won't help, only delay.
                     log.error("inject failed: error=%s %s", type(e).__name__, message_metadata(text))
                     self._turn_active.clear()
-                    self._notify_unsafe_pane(str(e))
+                    if nonce:
+                        self._n1.cancel(nonce)
+                    if notify:
+                        self._notify_unsafe_pane(str(e))
                     return False
             except Exception as e:
                 last_error = e
@@ -1628,7 +1672,10 @@ class AttachBridge:
         log.error("inject failed after %d attempts: error=%s %s", INJECT_ATTEMPTS,
                   type(last_error).__name__, message_metadata(text))
         self._turn_active.clear()
-        self._notify_inject_failed(text, str(last_error))
+        if nonce:
+            self._n1.cancel(nonce)
+        if notify:
+            self._notify_inject_failed(text, str(last_error))
         return False
 
     def _notify_inject_failed(self, text: str, reason: str) -> None:
@@ -1670,6 +1717,133 @@ class AttachBridge:
             )
         except Exception as e:
             log.warning("unsafe-pane owner notification failed: error=%s", type(e).__name__)
+
+    # ---- shared session (N1) -------------------------------------------------
+    def _n1_chat_authorised(self, chat) -> bool:
+        """Is this chat authorised RIGHT NOW (asked again at claim time, never remembered)."""
+        if type(chat) is not int:
+            return False
+        if chat >= 0:
+            return chat in self._allowed and chat in (self.cfg.allowed_user_ids or [])
+        return chat in (getattr(self.cfg, "allowed_group_ids", None) or [])
+
+    def _n1_busy(self) -> bool:
+        return self._turn_active.is_set() or self._n1_inflight > 0
+
+    def _n1_refuse(self) -> bool:
+        """R8: the correlation cannot be stored, so the prompt is NOT typed. Tell the authorised inbound
+        chat with a fixed text (best effort). Returns True: the message is handled, retrying would only
+        repeat the notice. Never reports success."""
+        self._turn_active.clear()
+        log.error("shared session: prompt NOT injected, correlation state unavailable")
+        chat = self._owner_chat
+        if chat is not None:
+            try:
+                self.tg.send_message(chat, shared.REFUSED_TEXT)
+            except Exception as e:
+                log.warning("shared session: refusal notice not sent: error=%s", type(e).__name__)
+        return True
+
+    def _n1_quiet_close(self) -> None:
+        """A Telegram turn is over without a turn end (a terminal record closed its window): stop
+        forwarding it and release the bridge, without the end-of-turn backstop."""
+        self._turn_from_tg = False
+        self._group_reply = None
+        self._group_files = ()
+        self._turn_active.clear()
+        self._n1_restore_owner()
+
+    def _n1_restore_owner(self) -> None:
+        if self._n1_notif_active:
+            self._n1_notif_active = False
+            if self._n1_prev_owner is not None:
+                self._owner_chat = self._n1_prev_owner
+            self._n1_prev_owner = None
+
+    def _n1_apply(self, out) -> None:
+        """Apply SharedSession's verdict on one transcript record. Called under ``_n1_gate``."""
+        if out.noop or not (out.changed or out.claim or out.blocked):
+            return
+        turn = out.turn
+        kind = turn["kind"] if turn and not out.blocked else None
+        if out.claim:
+            # This notification record started a claimed turn: durable intention already stored.
+            self._n1_prev_owner, self._n1_notif_active = self._owner_chat, True
+            self._owner_chat = out.claim["chat"]
+            self._begin_turn()
+            self._turn_from_tg = True
+            return
+        if kind == "tg":
+            self._owner_chat = turn["chat"]
+            self._turn_from_tg = True
+            self._turn_active.set()
+        elif kind == "notif":
+            self._turn_from_tg = True
+            self._turn_active.set()
+        elif self._turn_from_tg:
+            log.info("shared session: a non-Telegram record closed the Telegram turn")
+            self._n1_quiet_close()
+
+    def _n1_startup(self) -> None:
+        """Shared session: continue at the STORED offset (not EOF), so a completion that arrived while the
+        bridge was down is still seen; a replaced or truncated transcript revokes every binding."""
+        res = self._n1.sync_transcript(self._transcript)
+        if res is not None:
+            self._tpos = res.resume
+        turn = self._n1.turn()
+        if turn and turn["kind"] == "tg":
+            self._turn_from_tg, self._owner_chat = True, turn["chat"]
+
+    def _n1_turn_ended(self, text_sent: bool) -> None:
+        with self._n1_gate:
+            self._n1.turn_end(text_sent=text_sent)
+            self._n1_restore_owner()
+        self._n1_tick()
+
+    def _n1_tick(self) -> None:
+        """Outbound-loop housekeeping: expiry, recovery, idle fallback, and the next deferred claim."""
+        n1 = self._n1
+        n1.flush_offset()
+        n1.expire()
+        if n1.needs_sync():
+            res = n1.sync_transcript(self._transcript)
+            if res is not None and res.changed:
+                self._tpos = res.resume
+        turn = n1.turn()
+        if (turn is not None and not self._turn_active.is_set()
+                and time.monotonic() - self._n1_last_rec > self._idle_limit()):
+            n1.close_turn()                    # nobody ended it (no Stop hook): do not starve claims
+        claim = None
+        with self._n1_gate:
+            if not self._n1_busy():
+                claim = n1.claim_deferred()
+                if claim:                      # reserve the bridge before the gate is released
+                    self._n1_prev_owner, self._n1_notif_active = self._owner_chat, True
+                    self._owner_chat = claim["chat"]
+                    self._turn_active.set()
+        if claim:
+            (self._n1_run or self._n1_spawn)(lambda: self._n1_report(claim))
+
+    @staticmethod
+    def _n1_spawn(fn) -> None:
+        threading.Thread(target=fn, daemon=True).start()
+
+    def _n1_report(self, claim: dict) -> None:
+        """Deferred result: a fixed prompt, wrapped in the envelope stored with the claim, asks the
+        agent to report the finished task. Its own thread (a tmux write can take seconds). No notice is
+        sent to the stored chat on failure: it is not a current inbound context (R7)."""
+        ok = False
+        try:
+            self._begin_turn()
+            ok = self._inject(shared.REPORT_PROMPT.format(task=claim["task"]),
+                              nonce=claim["nonce"], notify=False)
+        except Exception as e:
+            log.error("shared session: report prompt failed: error=%s", type(e).__name__)
+            self._n1.cancel(claim["nonce"])
+        if not ok:
+            with self._n1_gate:
+                self._turn_active.clear()
+                self._n1_restore_owner()
 
     def _handle_command(self, text: str, chat_id: int, message_id: int | None = None) -> bool:
         """Answer a bridge-level slash command. Returns True if handled (don't forward to agent)."""
@@ -2050,6 +2224,8 @@ class AttachBridge:
                      time.time(), time.monotonic() - self._turn_started,
                      self._typing_count, self._max_gap, from_tg_at_end, text_sent_at_end,
                      reaction_at_end)
+        if self._n1 is not None:
+            self._n1_turn_ended(self._turn_text_sent and was_active)   # incl. a final sent just now
 
     def _end_turn(self, *, confirmed: bool = True, from_hook: bool = False) -> None:
         # Claude Stop-hook path: catch anything written just before the hook fired, then finish.
@@ -2073,6 +2249,15 @@ class AttachBridge:
         if not self._turn_active.is_set() or boundary is None:
             return True  # no injected turn to protect (e.g. startup/background cleanup)
         old_path, size, delivered_after = boundary
+        if self._n1 is not None:
+            turn = self._n1.turn()
+            if turn and turn["kind"] == "notif" and turn.get("nonce") is None:
+                # A claimed result turn is started by the task-notification record itself.
+                return rec.get("uuid") == turn.get("uuid")
+            if shared.classify(rec) == "notification":
+                # A completion that arrived DURING the turn is its latest "prompt" for the Stop hook;
+                # it belongs to this turn when it was written after our input (not a stale hook).
+                return old_path is not None and path.resolve() == old_path.resolve() and offset >= size
         text = self._reader.user_text(rec)
         origins = getattr(self, "_origins", (self.cfg.origin_prefix.strip(), "Telegram:", "[TG]"))
         if not text or not text.lstrip().startswith(tuple(p for p in origins if p)):
@@ -2120,6 +2305,8 @@ class AttachBridge:
                 self._flush_pending()         # re-deliver any reply a prior send failed to push
                 self._drain_transcript()      # may set _pending_turn_end (Codex task_complete)
                 self._drain_signal()
+                if self._n1 is not None:
+                    self._n1_tick()
                 # End-of-turn detection, in priority order:
                 #   * Codex: the reader saw task_complete → end now (no hook needed).
                 #   * Claude Code: the Stop hook wrote the end-of-turn marker. Authoritative even
@@ -2329,6 +2516,11 @@ class AttachBridge:
         if not self._transcript or not self._transcript.exists():
             return
         size = self._transcript.stat().st_size
+        n1 = self._n1
+        if n1 is not None and size != self._tpos:
+            res = n1.sync_transcript(self._transcript)      # replaced/truncated -> every binding revoked
+            if res is not None and res.changed:
+                self._tpos = res.resume
         if size < self._tpos:          # file rotated/truncated
             self._tpos = 0
         if size == self._tpos:
@@ -2353,6 +2545,9 @@ class AttachBridge:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if n1 is not None:
+                    with self._n1_gate:
+                        self._n1_apply(n1.on_record(rec_off, off, rec))
                 self._rec_live = self._record_is_live(rec_off, rec)
                 # Prompt identity is independent of reader delivery dedup: the user can
                 # legitimately repeat the same question in a later turn.
@@ -2371,6 +2566,9 @@ class AttachBridge:
                     self._handle_event(ev)
         finally:
             self._rec_live = False
+            if n1 is not None:
+                self._n1_last_rec = time.monotonic()
+                n1.advance(self._tpos)
         # Any new transcript content during a Telegram turn = the agent is still working; refresh
         # activity so the idle fallback doesn't fire prematurely.
         if self._turn_from_tg:
@@ -2502,6 +2700,8 @@ class AttachBridge:
 
     def _handle_event(self, ev) -> None:
         """Apply one normalized reader event to the Telegram side."""
+        if ev.kind == "user" and self._n1 is not None:
+            return                              # shared session: SharedSession decided the turn's origin
         if ev.kind == "user":
             # Remember whether this turn came from Telegram (origin prefix) — only those are
             # forwarded; terminal-originated turns stay local.
