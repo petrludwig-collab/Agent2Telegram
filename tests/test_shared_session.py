@@ -1498,6 +1498,63 @@ class FailurePathsAreUncertainTests(RigTestCase):
         self.assertEqual(r.bridge._route.kind, "other")
 
 
+class SendGateTests(RigTestCase):
+    """Each layer of the one gate is checked on its own (they are redundant on purpose)."""
+
+    def spy(self):
+        calls = []
+        real = self.rig.bridge._send_final
+        self.rig.bridge._send_final = lambda *a, **k: (calls.append(a), real(*a, **k))[1]
+        return calls
+
+    def test_reader_events_of_a_terminal_turn_never_reach_the_send_path(self):
+        r = self.rig
+        r.terminal("typing")
+        calls = self.spy()
+        r.say("[tg] marker in a terminal turn")
+        self.assertEqual(calls, [])
+
+    def test_the_send_path_itself_drops_in_a_terminal_turn(self):
+        r = self.rig
+        r.terminal("typing")
+        r.bridge._send_final("direct call")
+        r.tick()
+        self.assertEqual(r.client.sent, [])
+
+    def test_the_send_path_drops_in_a_cut_turn(self):
+        r = self.rig
+        r.terminal("t")
+        r.launch("term-job")
+        r.end_turn()
+        r.tg_turn(OWNER, "q")
+        r.notify("term-job")
+        r.bridge._send_final("direct call")
+        r.tick()
+        self.assertEqual(r.sent_to(OWNER), [shared.CUT_TEXT])
+
+    def test_a_group_marker_cannot_redirect_a_turn_to_another_chat(self):
+        r = self.rig
+        r.bridge.cfg.group_marker = "[grp]"
+        r.tg_turn(OWNER, "q")
+        r.say("[tg] [grp] for the group")
+        r.end_turn()
+        self.assertEqual(r.sent_to(GROUP), [])
+
+    def test_status_bubbles_follow_the_gate(self):
+        r = self.rig
+        r.terminal("typing")
+        r.bridge._turn_active.set()
+        r.bridge._status_push("tool line")
+        self.assertEqual(r.client.sent, [])
+
+    def test_send_files_follows_the_gate(self):
+        r = self.rig
+        r.terminal("typing")
+        with patch.object(r.bridge, "_safe_outbox_path") as safe:
+            r.bridge._send_files(["/tmp/x.txt"])
+        safe.assert_not_called()
+
+
 class StateFileTests(unittest.TestCase):
     def test_schema_validation_rejects_bad_files(self):
         import tempfile
