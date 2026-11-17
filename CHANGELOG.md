@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Opt-in offline mode: `AGENT2TELEGRAM_OFFLINE=1` makes every outbound HTTP request (Telegram
+  send/poll/download/upload, ElevenLabs STT/TTS) raise a typed `OfflineError` before any connection
+  is opened, and the bridge stops with that error instead of retrying. The switch is checked before every
+  attempt, including retries. Off by default; behaviour is unchanged
+  when the variable is unset.
 - Attach mode defaults to `group_interim: false`: group destinations receive the final
   answer and allowed attachments, with narration, tool/status bubbles, background progress,
   typing and queued-message acknowledgments suppressed. Private-chat progress is unchanged;

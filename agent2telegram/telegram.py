@@ -25,6 +25,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .offline import OfflineError, require_online
+
 log = logging.getLogger("agent2telegram.telegram")
 
 _ipv4_patched = False
@@ -156,6 +158,10 @@ class TelegramError(Exception):
         self.network_error = network_error
 
 
+class TelegramOfflineError(OfflineError, TelegramError):
+    """A Telegram request was refused because offline mode is on (not a network failure)."""
+
+
 def is_network_error(exc: BaseException) -> bool:
     """True for a transient network/DNS problem — whether direct (OSError/URLError/timeout,
     including gaierror "nodename nor servname"/Errno 8) or wrapped in ``TelegramError``
@@ -198,6 +204,7 @@ class TelegramClient:
         attempt = 0
         while True:
             attempt += 1
+            require_online(method, TelegramOfflineError)    # before EVERY attempt, retries included
             try:
                 req = urllib.request.Request(url, data=data, method="POST")
                 with self._opener.open(req, timeout=timeout) as resp:
@@ -266,6 +273,7 @@ class TelegramClient:
         url = f"{API_ROOT}/file/bot{self._token}/{file_path}"
         last = None
         for attempt in range(1, 4):
+            require_online("download", TelegramOfflineError)    # before every attempt
             try:
                 with self._opener.open(urllib.request.Request(url), timeout=timeout) as resp:
                     return resp.read()
@@ -360,6 +368,7 @@ class TelegramClient:
         attempt = 0
         while True:
             attempt += 1
+            require_online(method, TelegramOfflineError)    # before EVERY attempt, retries included
             req = urllib.request.Request(url, data=bytes(body), method="POST")
             req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
             try:
@@ -398,6 +407,7 @@ class TelegramClient:
             raise TelegramError(
                 f"{os.path.basename(path)} is {size // 1048576} MB; bots can send at most "
                 f"{self.MAX_UPLOAD // 1048576} MB — share a link instead")
+        require_online("send_file", TelegramOfflineError)   # after local checks, before the document fallback
         method, field = self.kind_for(path)
         fields = {"chat_id": chat_id}
         if caption:
@@ -454,6 +464,7 @@ class TelegramClient:
         """Send text, splitting to Telegram's size limit. By default (``parse_mode="auto"``)
         the agent's Markdown is rendered via HTML; on any parse failure we fall back to plain
         text so a message is never lost to a formatting glitch."""
+        require_online("sendMessage", TelegramOfflineError)   # before the plain-text fallbacks
         for chunk in split_message(text) or ["(empty response)"]:
             base = {"chat_id": chat_id, "disable_web_page_preview": "true"}
             if parse_mode == "auto":

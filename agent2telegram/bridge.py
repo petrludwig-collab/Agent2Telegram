@@ -24,6 +24,7 @@ from pathlib import Path
 
 from . import __version__, adapters
 from .config import Config, _state_dir
+from .offline import OfflineError
 from .redaction import message_metadata, update_metadata
 from .telegram import TelegramClient, TelegramError, is_network_error
 
@@ -80,6 +81,8 @@ class Bridge:
         while not self._stop.is_set():
             try:
                 updates = self.tg.get_updates(offset, timeout=self.cfg.poll_timeout)
+            except OfflineError:
+                raise                       # switched on mid-run: stop, do not log-and-retry
             except (TelegramError, OSError) as e:
                 if is_network_error(e):
                     # Transient network/DNS problem (Errno 8, connection reset, timeout) — the
@@ -123,6 +126,8 @@ class Bridge:
         while not self._stop.is_set():
             try:
                 return self.tg.get_me()
+            except OfflineError:
+                raise                       # not a transient outage: fail fast, do not retry forever
             except Exception as e:
                 log.warning("Telegram not reachable yet (%s); retrying in %ss", e, delay)
                 self._stop.wait(delay)

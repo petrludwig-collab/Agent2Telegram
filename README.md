@@ -215,6 +215,16 @@ python3 -m agent2telegram selftest --agent claude-code
 
 Both report `6/6 checks passed` on a working setup.
 
+## Offline mode (no network)
+
+For local tests, CI or demos, export `AGENT2TELEGRAM_OFFLINE=1` (`true`, `yes` and `on` work too).
+Every outbound HTTP request is then refused *before* a connection is opened: Telegram sends,
+`getUpdates` polling, file downloads/uploads and ElevenLabs speech-to-text/text-to-speech. A bot is
+never contacted, so a test run cannot become a second poller of a live bot. A refusal raises
+`OfflineError` (`TelegramError`/`STTError`/`TTSError` subclasses) with a message naming the switch;
+`run` exits instead of retrying, both at startup and if the switch is turned on while it runs. The variable is read on every request and is off by
+default; with it unset nothing changes.
+
 ---
 
 ## Uninstall

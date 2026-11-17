@@ -23,6 +23,8 @@ import time
 import urllib.error
 import urllib.request
 
+from .offline import OfflineError, require_online
+
 log = logging.getLogger("agent2telegram.tts")
 
 TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
@@ -39,6 +41,10 @@ _EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002190-\
 
 class TTSError(Exception):
     pass
+
+
+class TTSOfflineError(OfflineError, TTSError):
+    """Speech synthesis was refused because offline mode is on."""
 
 
 def sanitize_for_speech(text: str) -> str:
@@ -101,6 +107,7 @@ def synthesize(text: str, *, api_key: str, voice_id: str, model_id: str = DEFAUL
     op = opener or urllib.request.build_opener()
     attempts = len(retry_backoffs) + 1
     for attempt in range(attempts):
+        require_online("ElevenLabs TTS", TTSOfflineError)   # before every attempt
         try:
             with op.open(req, timeout=timeout) as resp:
                 audio = resp.read()
