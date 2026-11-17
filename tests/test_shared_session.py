@@ -1544,8 +1544,10 @@ class SendGateTests(RigTestCase):
         r = self.rig
         r.terminal("typing")
         r.bridge._turn_active.set()
+        bubbles = []
+        r.client.send_plain_id = lambda chat, text, parse_mode=None: bubbles.append((chat, text)) or 1
         r.bridge._status_push("tool line")
-        self.assertEqual(r.client.sent, [])
+        self.assertEqual(bubbles, [])
 
     def test_send_files_follows_the_gate(self):
         r = self.rig
