@@ -1404,7 +1404,10 @@ class AttachBridge:
                     f"(a few words or an emoji), nothing more.")
                 if self.cfg.inbound_sender_label:
                     text = f"{sender_label({'from': mr.get('user'), 'chat': mr.get('chat')}, self.cfg.language)} {text}"
-                return self._inject(text)
+                rchat = (mr.get("chat") or {}).get("id")
+                if self._n1 is None:
+                    return self._inject(text)
+                return self._inject(text, chat=rchat if type(rchat) is int else None)
             return True
 
         msg = upd.get("message") or upd.get("edited_message")
@@ -1481,7 +1484,9 @@ class AttachBridge:
             if not text:
                 return True
             self._begin_turn()
-            return self._inject(text)
+            if self._n1 is None:
+                return self._inject(text)           # default OFF: exactly the old call
+            return self._inject(text, chat=chat_id)
         return True
 
     def _legacy_chat(self) -> "int | None":
@@ -1635,7 +1640,8 @@ class AttachBridge:
             self._typing_count = 1
         log.info("TURN START t=%.2f", time.time())
 
-    def _inject(self, text: str, *, nonce: str | None = None, notify: bool = True) -> bool:
+    def _inject(self, text: str, *, nonce: str | None = None, notify: bool = True,
+                chat: int | None = None) -> bool:
         """Deliver a message to the session. A failure must NEVER be silent.
 
         Previously a failed write to tmux was only logged and the message vanished — the user
@@ -1650,10 +1656,12 @@ class AttachBridge:
         self._last_activity = time.monotonic()   # keep typing lit from the very start
         given = nonce
         if self._n1 is not None and nonce is None:
+            inbound_chat = chat if chat is not None else self._owner_chat
             try:
-                nonce = self._n1.issue(self._owner_chat)     # stored BEFORE anything is typed (R8)
+                # The chat of THIS message, passed in: the shared _owner_chat may have moved meanwhile.
+                nonce = self._n1.issue(inbound_chat)         # stored BEFORE anything is typed (R8)
             except shared.StateError:
-                return self._n1_refuse()
+                return self._n1_refuse(inbound_chat)
         extra = {"nonce": nonce} if nonce else {}
         inbound = given is None
         # Shared session: exactly ONE attempt. A tmux write that raised may still have typed the prompt
@@ -1745,13 +1753,12 @@ class AttachBridge:
     def _n1_busy(self) -> bool:
         return self._turn_active.is_set() or self._n1_inflight > 0
 
-    def _n1_refuse(self) -> bool:
+    def _n1_refuse(self, chat) -> bool:
         """R8: the correlation cannot be stored, so the prompt is NOT typed. Tell the authorised inbound
         chat with a fixed text (best effort). Returns True: the message is handled, retrying would only
         repeat the notice. Never reports success."""
         self._turn_active.clear()
         log.error("shared session: prompt NOT injected, correlation state unavailable")
-        chat = self._owner_chat
         if chat is not None:
             try:
                 self.tg.send_message(chat, shared.REFUSED_TEXT)
@@ -1896,6 +1903,8 @@ class AttachBridge:
                 if state not in ("issued", "consumed"):          # T1 passed / revoked: never consumed
                     log.warning("shared session: report prompt was not consumed")
                     self._n1_exit("report not consumed")
+            elif r.kind == "notif" and r.job and n1.job_state(r.job) != "claimed":
+                self._n1_exit("job is no longer claimed")        # uncertain/expired: the gate closes with it
             elif (not n1.healthy and r.kind != "none") or (turn is None and r.kind in ("tg", "notif", "other")):
                 self._n1_exit("store unusable" if not n1.healthy else "turn closed")
         claim = None
@@ -1924,7 +1933,7 @@ class AttachBridge:
             log.error("shared session: report prompt failed: error=%s", type(e).__name__)
         if not ok:
             with self._n1_gate:
-                if self._route.kind == "pending" and self._route.nonce == claim["nonce"]:
+                if self._route.nonce == claim["nonce"]:       # pending OR already consumed (notif)
                     self._n1_exit("report injection failed")
 
     def _handle_command(self, text: str, chat_id: int, message_id: int | None = None) -> bool:
@@ -2336,7 +2345,9 @@ class AttachBridge:
             turn = self._n1.turn()
             if turn and turn["kind"] == "notif" and turn.get("nonce") is None:
                 # A claimed result turn is started by the task-notification record itself.
-                return rec.get("uuid") == turn.get("uuid")
+                return (rec.get("uuid") == turn.get("uuid")
+                        or (shared.classify(rec) == "notification"
+                            and shared.notification_task_id(shared.record_text(rec)) == turn.get("job")))
             if shared.classify(rec) == "notification":
                 # A completion that arrived DURING the turn is its latest "prompt" for the Stop hook;
                 # it belongs to this turn when it was written after our input (not a stale hook).

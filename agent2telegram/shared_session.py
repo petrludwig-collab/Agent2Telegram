@@ -501,6 +501,9 @@ class SharedSession:
                 job = st["jobs"].get(rec.get("job") or "")
                 if rec["purpose"] == "report" and job and job["state"] == "claimed":
                     job["state"], job["at"] = "uncertain", self._clock()
+                    turn = st["turn"]
+                    if turn and turn["kind"] == "notif" and turn.get("job") == rec["job"]:
+                        st["turn"] = None                 # the result turn ends with its job
             try:
                 self._commit(f)
             except StateError:
@@ -548,6 +551,11 @@ class SharedSession:
             if self._s is not None and self.degraded is None and self._s["transcript"] is not None:
                 self._note_offset(end)
         self.flush_offset()
+
+    def job_state(self, task: str):
+        with self._lock:
+            job = (self._s or {}).get("jobs", {}).get(task)
+            return job["state"] if job else None
 
     def nonce_state(self, nonce: str) -> str | None:
         with self._lock:
@@ -600,6 +608,9 @@ class SharedSession:
                 nrec = st["nonces"].get(nonce)
                 if nrec and nrec["state"] == "issued":
                     nrec["state"], nrec["at"] = "revoked", now
+                    mjob = st["jobs"].get(nrec.get("job") or "")
+                    if nrec["purpose"] == "report" and mjob and mjob["state"] == "claimed":
+                        mjob["state"], mjob["at"] = "uncertain", now      # same transaction
                     log.warning("shared session: mixed input -> envelope revoked, turn is not Telegram")
         uuid = rec.get("uuid") if isinstance(rec.get("uuid"), str) else None
         if consumed:
@@ -673,13 +684,11 @@ class SharedSession:
         turn's forwarding is cut off, because the agent may now talk about that result and a report would
         follow (a second logical delivery). The cut also closes the binding window."""
         pending = self._valid_pending(st, job, now)
-        if turn["kind"] == "notif" and turn.get("job") == task:
-            return                                        # the very completion this turn reports
         if pending and not any(c["task"] == task for c in st["completions"]):
             st["completions"].append(defer)
         if turn["kind"] == "other" or turn.get("cut"):
             return
-        turn["cut"] = True
+        turn["cut"] = True                                # ANY notification, a repeat of the reported job included
         out.cut = True
         log.warning("shared session: completion inside a Telegram turn -> forwarding cut off")
 
@@ -718,8 +727,7 @@ class SharedSession:
                         if result and job and job["state"] == "pending":
                             keep.append(c)
                         continue
-                    if now - job["bound_at"] > self.job_ttl:
-                        job["state"], job["at"] = "expired", now
+                    if not self._valid_pending(st, job, now):
                         continue
                     if not self._authorised(job["chat"]):
                         job["state"], job["at"] = "blocked", now
@@ -760,6 +768,9 @@ class SharedSession:
                         job["state"], job["at"] = "expired", now
                     elif job["state"] == "claimed" and now - job["at"] > t2:
                         job["state"], job["at"] = "uncertain", now
+                turn = st["turn"]
+                if turn and turn["kind"] == "notif" and st["jobs"].get(turn.get("job") or "", {}).get("state") != "claimed":
+                    st["turn"] = None                         # its job is no longer claimed: the turn ends with it
                 st["completions"] = [c for c in st["completions"]
                                      if st["jobs"].get(c["task"], {}).get("state") == "pending"]
                 for n in [n for n, r in st["nonces"].items() if r["state"] != "issued" and now - r["at"] > 2 * t2]:

@@ -425,12 +425,15 @@ class Ak5NoSecondDeliveryTests(RigTestCase):
         r.tg_turn(OWNER)
         r.launch("t1")
         r.end_turn()
-        r.append(notification("t1", "d1"), notification("t1", "d2"), assistant("one result", "d3"))
+        r.append(notification("t1", "d1"), assistant("one result", "d3"), notification("t1", "d2"),
+                 assistant("a second one", "d4"))
         r.drain()
         r.end_turn()
         r.notify("t1")
         r.end_turn()
         self.assertEqual(r.sent_to(OWNER).count("one result"), 1)
+        self.assertNotIn("a second one", r.sent_to(OWNER))
+        self.assertEqual(r.job("t1"), "delivered")
 
     def test_backstop_and_marker_do_not_double_send_in_a_claimed_turn(self):
         r = self.rig
@@ -605,18 +608,34 @@ class DeferredCompletionTests(RigTestCase):
                 r.end_turn()
         self.assertNotIn("must not be forwarded", [t for _, t in r.client.sent])
 
-    def test_report_turn_is_not_cut_by_the_notification_it_reports(self):
+    def test_a_repeat_of_the_reported_jobs_notification_cuts_its_report_turn(self):
         r = self.rig
         self.prepare_a()
         r.terminal("busy")
         r.notify("tA")
         r.end_turn()
         r.submit()                                                     # report turn for tA is running
-        r.notify("tA")                                                 # the harness re-delivers it
-        self.assertFalse(r.n1.turn().get("cut"))
         r.say("[tg] result A")
+        r.tick()
+        r.notify("tA")                                                 # the same notification at another offset
+        self.assertTrue(r.n1.turn()["cut"])
+        r.say("[tg] a second answer to the repeat")
         r.end_turn()
-        self.assertEqual(r.sent_to(OWNER)[-1], "result A")
+        self.assertEqual(r.sent_to(OWNER), ["A started", "result A", shared.CUT_TEXT])
+        self.assertEqual(r.job("tA"), "delivered", "text was stored before the cut")
+
+    def test_a_repeat_cut_before_any_text_makes_the_job_uncertain_and_sends_nothing(self):
+        r = self.rig
+        self.prepare_a()
+        r.terminal("busy")
+        r.notify("tA")
+        r.end_turn()
+        r.submit()
+        r.notify("tA")
+        r.say("[tg] answer")
+        r.end_turn()
+        self.assertEqual(r.job("tA"), "uncertain")
+        self.assertEqual(r.sent_to(OWNER), ["A started", shared.CUT_TEXT])
 
     def test_completion_during_a_terminal_turn_is_deferred(self):
         r = self.rig
@@ -1653,6 +1672,103 @@ class RouteLifecycleTests(RigTestCase):
         r.bridge._end_turn(from_hook=True)
         self.assertEqual(r.bridge._route.kind, "none")
         self.assertFalse(r.bridge._turn_from_tg)
+
+
+class RecipientAndUncertainTests(RigTestCase):
+    def test_a_queued_envelope_consumed_between_enter_chat_and_inject_cannot_move_the_recipient(self):
+        r = self.rig
+        r.tg(OWNER, "queued A")
+        env_a = r.typed[-1]
+        r.bridge._turn_active.clear()                                  # a terminal record closed A's window meanwhile
+        real = r.bridge._n1_enter_chat
+
+        def enter_then_consume(chat_id):
+            real(chat_id)
+            r.submit(env_a)                                            # A's envelope is consumed right now
+            self.assertEqual(r.bridge._owner_chat, OWNER)
+        r.bridge._n1_enter_chat = enter_then_consume
+        r.tg(GROUP, "message of B")
+        nonce_b = shared.parse_envelope(r.typed[-1])[0]
+        self.assertEqual(r.n1.snapshot()["nonces"][nonce_b]["chat"], GROUP)
+
+    def test_the_refusal_goes_to_the_chat_of_the_refused_message(self):
+        r = self.rig
+        real = r.bridge._n1_enter_chat
+
+        def enter_then_move(chat_id):
+            real(chat_id)
+            r.bridge._owner_chat = OWNER                               # the shared variable moves meanwhile
+        r.bridge._n1_enter_chat = enter_then_move
+        with patch.object(r.n1, "issue", side_effect=shared.StateError("x")):
+            r.tg(GROUP, "B")
+        self.assertEqual(r.client.sent, [(GROUP, shared.REFUSED_TEXT)])
+
+    def consumed_report(self):
+        r = self.rig
+        r.tg_turn(OWNER)
+        r.launch("t1")
+        r.end_turn()
+        r.terminal("busy")
+        r.notify("t1")
+        r.end_turn()
+        r.submit()                                                     # report envelope consumed: route is notif
+        self.assertEqual(r.bridge._route.kind, "notif")
+
+    def test_cancel_after_consumption_closes_the_gate(self):
+        r = self.rig
+        self.consumed_report()
+        r.n1.cancel(r.bridge._route.nonce)
+        self.assertEqual(r.job("t1"), "uncertain")
+        r.tick()
+        self.assertEqual(r.bridge._route.kind, "none")
+        r.say("[tg] output after the job became uncertain")
+        r.tick()
+        self.assertEqual(r.sent_to(OWNER), [])
+
+    def test_expiry_during_an_active_report_closes_the_gate(self):
+        r = self.rig
+        clock = Clock()
+        r.n1._clock = clock
+        self.consumed_report()
+        clock.t += 86401
+        r.tick()
+        self.assertEqual(r.job("t1"), "uncertain")
+        self.assertEqual(r.bridge._route.kind, "none")
+        r.say("[tg] late output")
+        r.tick()
+        self.assertEqual(r.sent_to(OWNER), [])
+
+    def test_mixed_input_on_a_report_envelope_makes_the_job_uncertain_in_the_same_write(self):
+        r = self.rig
+        r.tg_turn(OWNER)
+        r.launch("t1")
+        r.end_turn()
+        r.terminal("busy")
+        r.notify("t1")
+        r.end_turn()
+        mangled = "draft " + r.typed[-1]
+        r.append(human(mangled, "mixed-1"))
+        r.bridge._drain_transcript()
+        self.assertEqual(r.job("t1"), "uncertain")
+
+    def test_a_deferred_claim_re_validates_the_session(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "s.jsonl"
+            transcript.write_text(json.dumps(human("h", "h0")) + "\n")
+            s = SharedSession(Path(tmp) / "st.json")
+            s.load()
+            s.sync_transcript(transcript)
+            now = 1000.0
+            s._clock = lambda: now
+
+            def seed(st):
+                st["jobs"]["old"] = {"chat": 7, "nonce": "N" * 26, "session": "another-session", "state": "pending",
+                                     "bound_at": now, "at": now}
+                st["completions"].append({"task": "old", "offset": 1, "seen_at": now})
+            s._commit(seed)
+            self.assertIsNone(s.claim_deferred())
+            self.assertEqual(s.snapshot()["jobs"]["old"]["state"], "revoked")
 
 
 class StateFileTests(unittest.TestCase):
