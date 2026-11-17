@@ -16,6 +16,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+from .offline import OfflineError, require_online
+
 log = logging.getLogger("agent2telegram.stt")
 
 ELEVENLABS_URL = "https://api.elevenlabs.io/v1/speech-to-text"
@@ -25,6 +27,10 @@ TRANSIENT_BACKOFFS = (1.0, 3.0)
 
 class STTError(Exception):
     pass
+
+
+class STTOfflineError(OfflineError, STTError):
+    """Transcription was refused because offline mode is on."""
 
 
 class EmptyTranscript(STTError):
@@ -128,6 +134,7 @@ def transcribe_elevenlabs(audio: bytes, *, api_key: str, filename: str = "voice.
     op = opener or urllib.request.build_opener()
     attempts = len(retry_backoffs) + 1
     for attempt in range(attempts):
+        require_online("ElevenLabs STT", STTOfflineError)   # before every attempt
         try:
             with op.open(req, timeout=timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))

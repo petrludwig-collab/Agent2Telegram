@@ -42,6 +42,7 @@ from .config import Config, _state_dir
 from .durable import DurableInbox, DurableOutbox
 from .inbound import sender_label
 from .notices import busy_text, restart_notice
+from .offline import OfflineError
 from .redaction import message_metadata, update_metadata
 from .session import SessionError, TmuxSession
 from .telegram import TelegramClient, TelegramError, is_network_error, split_message
@@ -1280,6 +1281,8 @@ class AttachBridge:
                      "allowed_updates": allowed_updates},
                     timeout=self.cfg.poll_timeout + 15,
                 )
+            except OfflineError:
+                raise                       # switched on mid-run: stop, do not log-and-retry
             except (TelegramError, OSError) as e:
                 if is_network_error(e):
                     # Transient network/DNS problem (Errno 8 "nodename nor servname", connection
