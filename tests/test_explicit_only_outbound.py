@@ -531,11 +531,13 @@ class AllowedPaths(Base):
         threads = [threading.Thread(target=passive) for _ in range(4)]
         for t in threads:
             t.start()
-        for i in range(25):
-            b.tg.send_service(7, op.ChatId(i))
-        stop.set()
-        for t in threads:
-            t.join()
+        try:
+            for i in range(25):
+                b.tg.send_service(7, op.ChatId(i))
+        finally:
+            stop.set()
+            for t in threads:
+                t.join()
         self.assertEqual(self.rec.texts(), [f"Your Telegram id: `{i}`" for i in range(25)])
 
 
@@ -573,6 +575,7 @@ class PendingQueueRestart(Base):
                 self.seed(kind)
                 b = self.bridge()
                 before = snapshot(self.state)
+                b._stop.set()                  # an un-guarded start must end, not hang
                 with self.assertRaises(op.OutboundQueuePresent):
                     b._run_locked()
                 self.assertEqual(snapshot(self.state), before, "mtime/location/inode changed")
