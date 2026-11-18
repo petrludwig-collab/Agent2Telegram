@@ -1885,7 +1885,8 @@ class AttachBridge:
         """Outbound-loop housekeeping: expiry, recovery, idle fallback, and the next deferred claim."""
         n1 = self._n1
         n1.flush_offset()
-        n1.expire()
+        with self._n1_gate:                    # expiry never slips under a report worker's check + write
+            n1.expire()
         if n1.needs_sync():
             res = n1.sync_transcript(self._transcript, self._tpos)
             if res is not None and res.changed:
@@ -1927,21 +1928,22 @@ class AttachBridge:
         agent to report the finished task. Its own thread (a tmux write can take seconds). No notice is
         sent to the stored chat on failure: it is not a current inbound context (R7)."""
         ok = False
+        # The validity check and the ONE tmux write are atomic with respect to expiry, release and the start
+        # of another turn: all of them take this gate. Nothing in the write path takes it again except as the
+        # re-entrant owner, and the write is a single bounded attempt.
         with self._n1_gate:
             r = self._route
             if r.kind != "pending" or r.nonce != claim["nonce"] or self._n1.nonce_state(claim["nonce"]) != "issued":
                 log.warning("shared session: stale report worker dropped (claim no longer valid)")
                 return                              # released/expired meanwhile: touch nothing of a newer turn
-            self._begin_turn()
-        try:
-            ok = self._inject(shared.REPORT_PROMPT.format(task=claim["task"]),
-                              nonce=claim["nonce"], notify=False)
-        except Exception as e:
-            log.error("shared session: report prompt failed: error=%s", type(e).__name__)
-        if not ok:
-            with self._n1_gate:
-                if self._route.nonce == claim["nonce"]:       # pending OR already consumed (notif)
-                    self._n1_exit("report injection failed")
+            try:
+                self._begin_turn()
+                ok = self._inject(shared.REPORT_PROMPT.format(task=claim["task"]),
+                                  nonce=claim["nonce"], notify=False)
+            except Exception as e:
+                log.error("shared session: report prompt failed: error=%s", type(e).__name__)
+            if not ok and self._route.nonce == claim["nonce"]:       # pending OR already consumed (notif)
+                self._n1_exit("report injection failed")
 
     def _handle_command(self, text: str, chat_id: int, message_id: int | None = None) -> bool:
         """Answer a bridge-level slash command. Returns True if handled (don't forward to agent)."""

@@ -212,6 +212,65 @@ class StaleReportWorkerTests(RigTestCase):
         self.assertTrue(r.bridge._turn_from_tg)
         self.assertEqual(r.job("t1"), "uncertain")
 
+    def paused_write(self, clock):
+        """Start the worker in a thread and pause it AFTER its validity check, AT the tmux write."""
+        import threading
+        r = self.rig
+        worker = self.reserve()
+        at_write, resume = threading.Event(), threading.Event()
+        real = r.bridge._session.inject
+
+        def slow_inject(*a, **k):
+            at_write.set()
+            resume.wait(10)
+            return real(*a, **k)
+        r.bridge._session.inject = slow_inject
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        self.assertTrue(at_write.wait(5))
+        return t, resume
+
+    def test_expiry_and_a_new_turn_cannot_slip_between_the_check_and_the_tmux_write(self):
+        import threading
+        r = self.rig
+        clock = type("C", (), {"t": 1_000_000.0, "__call__": lambda s: s.t})()
+        r.n1._clock = clock
+        t, resume = self.paused_write(clock)
+        clock.t += 601                                                 # the claim expires while the write is pending
+        r.bridge._n1_run = lambda fn: fn()
+        tick_done = threading.Event()
+        threading.Thread(target=lambda: (r.tick(), tick_done.set()), daemon=True).start()
+        self.assertFalse(tick_done.wait(0.4), "expiry/release must wait for the single write (check + write are atomic)")
+        self.assertEqual(r.bridge._route.kind, "pending", "the route is not released under the writer's feet")
+        self.assertEqual(r.n1.nonce_state(r.bridge._route.nonce), "issued", "the claim is not expired under it either")
+        resume.set()
+        t.join(5)
+        self.assertTrue(tick_done.wait(5), "nothing deadlocks once the slow write completed")
+        typed_for_report = [x for x in r.typed if "t1" in x]
+        self.assertEqual(len(typed_for_report), 1)
+        self.assertEqual(r.job("t1"), "uncertain")                     # then T1 releases it, never retried
+        self.assertEqual(r.bridge._route.kind, "none")
+        typed = len(r.typed)
+        r.tg_turn(GROUP, "the next turn")                              # a new turn proceeds normally
+        self.assertEqual(len(r.typed), typed + 1)
+        self.assertEqual(r.n1.turn()["chat"], GROUP)
+
+    def test_inbound_proceeds_after_a_slow_write_completed(self):
+        import threading
+        r = self.rig
+        t, resume = self.paused_write(None)
+        done = threading.Event()
+        typed_before = len(r.typed)
+        threading.Thread(target=lambda: (r.tg(OWNER, "inbound while the report is being typed"), done.set()),
+                         daemon=True).start()
+        self.assertFalse(done.wait(0.3), "inbound waits behind the pending report turn")
+        resume.set()
+        t.join(5)
+        r.submit(r.typed[typed_before])                                # the report envelope is consumed ...
+        r.say("[tg] result")
+        r.end_turn()                                                   # ... and its turn ends
+        self.assertTrue(done.wait(5), "the queued inbound message is processed afterwards")
+
     def test_a_worker_whose_claim_is_still_valid_injects_exactly_once(self):
         r = self.rig
         worker = self.reserve()
