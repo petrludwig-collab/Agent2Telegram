@@ -42,6 +42,8 @@ class UnreadableLineTests(RigTestCase):
         r = self.rig
         r.tg_turn(OWNER)
         with r.transcript.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "assistant", "uuid": "c0", "message": {"stop_reason": "end_turn", "content": [
+                {"type": "text", "text": "[tg] complete line"}]}}) + "\n")
             f.write('{"type": "assistant", "uuid": "p1", "mess')       # still being written, no newline
         r.drain()
         self.assertTrue(r.bridge._turn_from_tg)
@@ -50,7 +52,7 @@ class UnreadableLineTests(RigTestCase):
             f.write('age": {"stop_reason": "end_turn", "content": [{"type": "text", "text": "[tg] finished line"}]}}\n')
         r.drain()
         r.tick()
-        self.assertEqual(r.sent_to(OWNER), ["finished line"])
+        self.assertEqual(r.sent_to(OWNER), ["complete line", "finished line"])
 
     def test_blank_lines_are_not_unreadable(self):
         r = self.rig
