@@ -364,6 +364,53 @@ class QueuedEnvelopeChecksTests(DirectCase):
         self.assertEqual(r.n1.turn()["kind"], "other")
         self.assertEqual(r.client.sent, [])
 
+    def pad_to(self, offset):
+        """Filler records (not input) until the transcript is exactly ``offset`` bytes long."""
+        r = self.rig
+        base = len(json.dumps({"type": "summary", "pad": ""})) + 1
+        while True:
+            need = offset - r.transcript.stat().st_size
+            if need == 0:
+                return
+            self.assertGreaterEqual(need, base, "cannot pad to that offset")
+            if need <= base + 300:
+                n = need - base
+            else:
+                n = 300 if need - (base + 300) >= base else need - 2 * base
+            r.append({"type": "summary", "pad": "x" * n})
+
+    def reused_offset_after_a_reset(self):
+        """An old consumed envelope of chat A, a transcript reset, a new route of chat B, and a record that carries the old
+        envelope at the very offset where it was first consumed."""
+        r = self.rig
+        r.tg(OWNER, "old input of chat A")
+        old_prompt = r.typed[-1]
+        self.pad_to(2000)
+        r.submit(old_prompt)                                           # consumed at offset 2000
+        nonce = shared.parse_envelope(old_prompt)[0]
+        self.assertEqual(r.n1.snapshot()["nonces"][nonce]["offs"], [2000])
+        replacement = r.tmp / "new.jsonl"
+        replacement.write_text(json.dumps(human("another session", "z0")) + "\n")
+        os.replace(replacement, r.transcript)
+        r.drain()                                                      # reset: consumed nonces are closed
+        r.tg_turn(GROUP, "a new route of chat B")
+        self.assertEqual((r.bridge._route.kind, r.bridge._route.chat), ("tg", GROUP))
+        self.pad_to(2000)
+        return r, old_prompt, nonce
+
+    def test_a_human_record_at_a_reused_offset_after_a_reset_is_not_a_re_read(self):
+        r, old_prompt, nonce = self.reused_offset_after_a_reset()
+        r.submit(old_prompt)                                           # same offset, OLD generation
+        self.assertEqual(r.n1.snapshot()["nonces"][nonce]["replays"], 1, "a replay, not a no-op re-read")
+        self.assertEqual(r.bridge._route.kind, "other", "chat B's route ended at this turn boundary")
+        self.assertEqual(r.n1.turn()["kind"], "other")
+
+    def test_a_queued_record_at_a_reused_offset_after_a_reset_cuts_chat_bs_route(self):
+        r, old_prompt, nonce = self.reused_offset_after_a_reset()
+        self.queue(old_prompt)
+        self.assertEqual(r.n1.snapshot()["nonces"][nonce]["replays"], 1)
+        self.assertTrue(r.bridge._route.cut, "unvalidated input never keeps chat B's forwarding open")
+
     def test_the_second_appearance_is_refused_after_t2(self):
         r, prompt, nonce = self.second_appearance_refusals("t2")
         clock = Clock()

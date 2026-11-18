@@ -280,6 +280,12 @@ def _validate(st) -> None:
              and isinstance(job.get("at"), (int, float)) and isinstance(job.get("session"), str))
 
 
+def _generation(st: dict) -> str:
+    """Identity of the transcript the offsets belong to: an offset means nothing in another generation."""
+    t = st["transcript"]
+    return f"{t['ino']}:{t['dev']}:{t['head']}"
+
+
 def _identity(path: Path) -> dict | None:
     try:
         st = path.stat()
@@ -746,12 +752,15 @@ class SharedSession:
             elif now - nrec["at"] <= self.job_ttl and nrec["session"] == st["transcript"]["session"]:
                 # Bound by the session and the long orphan bound T2, NOT by T1: an input may wait in Claude's queue.
                 nrec["appearances"], nrec["offs"], nrec["first_kind"] = 1, [offset], kind
+                nrec["gen"] = _generation(st)
                 return nonce
             else:
                 nrec["state"], nrec["at"] = "expired", now
         elif nrec and nrec["state"] == "consumed":
-            if offset in nrec.get("offs", [nrec.get("off")]):
-                out.noop = True                           # this very record, re-read after a restart
+            if (not nrec.get("closed") and nrec["session"] == st["transcript"]["session"]
+                    and nrec.get("gen") == _generation(st)
+                    and offset in nrec.get("offs", [nrec.get("off")])):
+                out.noop = True                           # this very record, re-read after a restart (same generation only)
                 return None
             if (nrec.get("fp") == fingerprint(inner) and nrec.get("appearances", 1) == 1
                     and nrec.get("first_kind") == "queued" and kind == "human" and not nrec.get("closed")
