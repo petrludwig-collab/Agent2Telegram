@@ -227,28 +227,6 @@ class RestartNotice(ServiceReply):
         return default_restart_text(self.language)
 
 
-@dataclass(frozen=True)
-class ReactionAck:
-    """Fixed-emoji acknowledgement of an inbound message (setMessageReaction)."""
-    chat_id: int
-    message_id: int
-    EMOJI = "👍"
-
-    def __post_init__(self):
-        _int(self.chat_id, "chat_id")
-        _int(self.message_id, "message_id")
-
-
-@dataclass(frozen=True)
-class CallbackAck:
-    """answerCallbackQuery WITHOUT text."""
-    callback_query_id: str
-
-    def __post_init__(self):
-        if type(self.callback_query_id) is not str or not self.callback_query_id.isdigit():
-            raise TypeError("callback_query_id must be a numeric string")
-
-
 class OutboundGuard:
     """Wraps whatever client the bridge was given. Default deny; the only way to send is
     ``send_service``. A denied call is logged (metadata only) and handled, never raised, so it
@@ -288,13 +266,6 @@ class OutboundGuard:
         """The recipient comes only from the typed reply (``reply.chat_id``)."""
         if isinstance(reply, ServiceReply):
             return self._inner.send_message(reply.chat_id, reply.render())
-        if isinstance(reply, ReactionAck):
-            return self._inner._call("setMessageReaction", {
-                "chat_id": reply.chat_id, "message_id": reply.message_id,
-                "reaction": '[{"type":"emoji","emoji":"%s"}]' % ReactionAck.EMOJI})
-        if isinstance(reply, CallbackAck):             # no chat id, no text
-            return self._inner._call("answerCallbackQuery",
-                                     {"callback_query_id": reply.callback_query_id})
         self._deny(f"send_service({type(reply).__name__})")
 
     # ---- everything else that can put content in a chat is denied -------------------

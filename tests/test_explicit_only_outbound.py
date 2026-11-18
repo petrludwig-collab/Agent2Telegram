@@ -504,22 +504,21 @@ class AllowedPaths(Base):
             op.AudioTooLarge("5 MB; transcript")
         self.assertEqual(self.rec.texts(), ["Your Telegram id: `7`"])
 
-    def test_row14_control_calls_reactions_callbacks(self):
+    def test_row14_control_calls_pass_and_reaction_callback_calls_are_denied(self):
         b = self.bridge()
         b.tg.set_my_commands(BOT_COMMANDS)
         b.tg.get_me()
         b.tg._call("getUpdates", {})
-        b.tg.send_service(op.ReactionAck(7, 3))
-        b.tg.send_service(op.CallbackAck("12345"))
+        # upstream has no outbound reaction/callback call; the guard has no door for them either
+        b.tg._call("setMessageReaction", {"chat_id": 7, "message_id": 3})
+        b.tg._call("answerCallbackQuery", {"callback_query_id": "1"})
+        b.tg.send_service(("setMessageReaction", 7, 3))
         names = [(c[0], c[1][0] if c[0] == "_call" else None) for c in self.rec.calls]
-        self.assertEqual(names, [("set_my_commands", None), ("get_me", None), ("_call", "getUpdates"),
-                                 ("_call", "setMessageReaction"), ("_call", "answerCallbackQuery")])
-        react = self.rec.calls[3][1][1]
-        self.assertIn("👍", react["reaction"])
-        self.assertNotIn("text", self.rec.calls[4][1][1])
+        self.assertEqual(names, [("set_my_commands", None), ("get_me", None), ("_call", "getUpdates")])
         self.assertEqual(self.rec.calls[0][1][0], BOT_COMMANDS)
-        with self.assertRaises(TypeError):
-            op.ReactionAck(7, "3")
+        self.assertEqual(b.tg.denied, ["_call(setMessageReaction)", "_call(answerCallbackQuery)",
+                                       "send_service(tuple)"])
+        self.assertFalse(hasattr(op, "ReactionAck") or hasattr(op, "CallbackAck"))
 
     def test_unknown_guard_method_does_not_break_the_inbound_loop(self):
         b = self.bridge()
@@ -587,6 +586,175 @@ class AllowedPaths(Base):
             for t in threads:
                 t.join()
         self.assertEqual(self.rec.texts(), [f"Your Telegram id: `{i}`" for i in range(25)])
+
+
+class ServiceErrorsThroughRealHandlers(Base):
+    """ON mode, driven through ``AttachBridge._handle`` (the real inbound handler, real guard,
+    real ``_inject`` / ``_transcribe`` / ``_download_note``). Each failure gives exactly ONE fixed
+    explanatory reply, never a success/ack, never exception text or message content, and nothing
+    reaches the agent. The expected strings are literals, not ``render()`` output."""
+
+    INJECT = ("⚠️ Couldn't deliver your message to the agent session after 3 attempts. "
+              "Check the session, then send it again.")
+    PANE = ("⚠️ A Telegram message was blocked because the configured session no longer "
+            "appears to be running the expected agent. Restart it, then resend the message.")
+    DOWNLOAD = "⚠️ Couldn't download the attachment."
+    STT = "🎤 Voice transcription failed. Please resend it or type your message instead."
+
+    def assertOneFixedReply(self, b, expected):
+        self.assertEqual(self.rec.texts(), [expected])
+        self.assertEqual(len(self.rec.content()), 1, "only that one send_message, no ack/reaction/typing")
+        self.assertEqual(b._session.injected, [], "a failed message must not reach the agent")
+        self.assertFalse(b._turn_active.is_set(), "no turn left open as if the message had been accepted")
+        self.assertEqual(b.tg.denied, [])
+        for secret in ("PRIVATE", "SECRET", "hello", "RuntimeError"):
+            self.assertNotIn(secret, self.rec.texts()[0])
+        self.assertFalse((self.state / "queue").exists())
+
+    def test_failed_message_injection(self):
+        assert attach_mod.INJECT_ATTEMPTS == 3
+        b = self.bridge()
+        b._session.error = RuntimeError("PRIVATE-REASON")
+        with mock.patch.object(attach_mod, "INJECT_RETRY_WAIT", 0):
+            self.assertFalse(b._handle(self.msg("hello there")))
+        self.assertOneFixedReply(b, self.INJECT)
+
+    def test_unsafe_tmux_pane(self):
+        b = self.bridge()
+        b._session.error = SessionError("refusing to inject PRIVATE-PANE-DETAIL")
+        self.assertFalse(b._handle(self.msg("hello there")))
+        self.assertOneFixedReply(b, self.PANE)
+
+    def test_attachment_download_failure(self):
+        b = self.bridge()
+        self.rec.fail_file_path = True
+        self.assertTrue(b._handle(self.msg(document={"file_id": "d", "file_name": "SECRET.pdf",
+                                                      "file_size": 10})))
+        self.assertOneFixedReply(b, self.DOWNLOAD)
+        self.assertFalse((self.root / "home" / ".local").exists(), "nothing was saved")
+
+    def test_voice_stt_failure_in_the_transcription_call(self):
+        b = self.bridge(elevenlabs_api_key="k")
+        with mock.patch("agent2telegram.stt.transcribe", side_effect=RuntimeError("PRIVATE-STT")):
+            self.assertTrue(b._handle(self.msg(voice={"file_id": "v", "file_size": 10})))
+        self.assertOneFixedReply(b, self.STT)
+
+    def test_voice_fetch_failure_is_reported_as_stt_failure(self):
+        b = self.bridge(elevenlabs_api_key="k")
+        self.rec.fail_file_path = True
+        self.assertTrue(b._handle(self.msg(voice={"file_id": "v", "file_size": 10})))
+        self.assertOneFixedReply(b, self.STT)
+
+    def test_voice_without_speech_has_its_own_fixed_reply(self):
+        from agent2telegram import stt
+        b = self.bridge(elevenlabs_api_key="k")
+        with mock.patch("agent2telegram.stt.transcribe", side_effect=stt.EmptyTranscript("PRIVATE")):
+            self.assertTrue(b._handle(self.msg(voice={"file_id": "v", "file_size": 10})))
+        self.assertOneFixedReply(b, "🎤 I couldn't hear any speech in that voice note. "
+                                    "Please record it again.")
+
+    def test_success_is_not_confused_with_failure(self):
+        """Contrast: when injection works there is no reply at all (no false confirmation)."""
+        b = self.bridge()
+        self.assertTrue(b._handle(self.msg("hello there")))
+        self.assertEqual(b._session.injected, ["hello there"])
+        self.assertEqual(self.rec.content(), [])
+
+    def test_passive_transcript_with_service_wording_is_not_delivered(self):
+        b = self.bridge()
+        b._begin_turn()
+        self.user()
+        for i, wording in enumerate((self.INJECT, self.PANE, self.DOWNLOAD, self.STT, "⛔ Not authorized.",
+                                     "Not available in explicit-only mode.", "[service] " + self.DOWNLOAD)):
+            self.assistant(wording, uuid=f"s{i}", stop="tool_use" if i % 2 else "end_turn")
+        b._drain_transcript()
+        b._finish_turn()
+        self.one_outbound_pass(b)
+        b._flush_pending()
+        self.assertEqual(self.rec.content(), [])
+        self.assertEqual(self.rec.texts(), [])
+
+    def test_door_rejects_objects_that_merely_look_like_a_service_reply(self):
+        """Transcript-derived text re-wrapped as 'something with a chat_id and text/render' is
+        not a typed ServiceReply: the door denies it, nothing is sent."""
+        b = self.bridge()
+        class Duck:
+            chat_id = 7
+            text = "⚠️ Couldn't download the attachment."
+            def render(self): return self.text
+        for fake in (Duck(), SimpleNamespace(chat_id=7, text=Duck.text), {"chat_id": 7, "text": Duck.text},
+                     Duck.text):
+            b.tg.send_service(fake)
+        self.assertEqual(self.rec.content(), [])
+        self.assertEqual(len(b.tg.denied), 4)
+
+    def test_passive_lookalike_never_replaces_or_joins_the_real_reply(self):
+        b = self.bridge()
+        b._begin_turn()
+        self.user()
+        self.assistant(self.DOWNLOAD, uuid="p1")           # looks exactly like a service reply
+        b._drain_transcript()
+        self.rec.fail_file_path = True
+        b._handle(self.msg(document={"file_id": "d", "file_size": 10}))
+        b._finish_turn()
+        self.one_outbound_pass(b)
+        self.assertEqual(self.rec.texts(), [self.DOWNLOAD], "exactly the one real service reply")
+        self.assertEqual(len(self.rec.content()), 1)
+
+
+class ServiceErrorsOffParity(Base):
+    """Flag off: the same four failures keep their ORIGINAL (richer) wording. Runs unchanged on
+    the base SHA."""
+    explicit = False
+
+    def cfg(self, **kw):
+        kw.pop("explicit_only_outbound", None)
+        base = dict(agent="claude-code", token="1:abc", allowed_user_ids=[7], tmux_session="t",
+                    mode="attach", signal_file=str(self.state / "answer.txt"),
+                    state_dir=str(self.state))
+        base.update(kw)
+        c = Config(**base)
+        c.validate()
+        return c
+
+    def sent(self, b):
+        b._flush_pending()
+        return [c[1][1] for c in self.rec.calls if c[0] == "send_message"]
+
+    def test_inject_failure_text_unchanged(self):
+        b = self.bridge()
+        b._session.error = RuntimeError("PRIVATE-REASON")
+        with mock.patch.object(attach_mod, "INJECT_RETRY_WAIT", 0):
+            b._handle(self.msg("hello there"))
+        (t,) = self.sent(b)
+        self.assertTrue(t.startswith("⚠️ Couldn't deliver your message to the agent session — "
+                                     "the write to tmux failed after 3 attempts."))
+        self.assertIn("Message: hello there", t)
+        self.assertIn("PRIVATE-REASON", t)
+
+    def test_unsafe_pane_text_unchanged(self):
+        b = self.bridge()
+        b._session.error = SessionError("refusing to inject X")
+        b._handle(self.msg("hello there"))
+        (t,) = self.sent(b)
+        self.assertTrue(t.startswith("⚠️ Agent2Telegram blocked a Telegram message because the "
+                                     "configured tmux session no longer appears"))
+        self.assertIn("refusing to inject X", t)
+
+    def test_download_failure_text_unchanged(self):
+        b = self.bridge()
+        self.rec.fail_file_path = True
+        b._handle(self.msg(document={"file_id": "d", "file_size": 10}))
+        self.assertEqual(self.sent(b), ["⚠️ Couldn't download the attachment (too large, or a "
+                                        "transient error — try again)."])
+
+    def test_stt_failure_text_unchanged(self):
+        b = self.bridge(elevenlabs_api_key="k")
+        with mock.patch("agent2telegram.stt.transcribe", side_effect=RuntimeError("PRIVATE-STT")):
+            b._handle(self.msg(voice={"file_id": "v", "file_size": 10}))
+        (t,) = self.sent(b)
+        self.assertEqual(t, "🎤 Voice transcription failed (PRIVATE-STT). "
+                            "Please resend it or type your message instead.")
 
 
 class PendingQueueRestart(Base):
