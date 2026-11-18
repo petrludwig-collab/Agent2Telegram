@@ -173,6 +173,17 @@ class DirectInputTests(DirectCase):
         self.assertEqual(r.bridge._route.kind, "none", "the hook still names the prompt of the running route")
         self.assertIsNone(r.n1.turn())
 
+    def test_stop_hook_ends_a_route_that_a_record_with_mixed_in_terminal_text_opened(self):
+        r = self.rig
+        r.bridge._idle_limit = lambda: 10 ** 9
+        self.assertTrue(r.tg(OWNER, "from Telegram"))
+        r.submit("terminal draft " + r.typed[-1])                      # one envelope among terminal typing
+        self.assertEqual(r.bridge._route.kind, "tg")
+        r.say("[tg] common answer")
+        r.stop()
+        r.tick()
+        self.assertEqual(r.bridge._route.kind, "none", "the hook names the record that opened the route")
+
     def test_no_correctness_depends_on_the_idle_fallback(self):
         r = self.rig
         r.bridge._idle_limit = lambda: 10 ** 9
