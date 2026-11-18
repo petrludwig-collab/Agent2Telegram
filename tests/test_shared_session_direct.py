@@ -411,6 +411,23 @@ class QueuedEnvelopeChecksTests(DirectCase):
         self.assertEqual(r.n1.snapshot()["nonces"][nonce]["replays"], 1)
         self.assertTrue(r.bridge._route.cut, "unvalidated input never keeps chat B's forwarding open")
 
+    def test_each_condition_of_the_re_read_check_matters_on_its_own(self):
+        for label, tamper in (("untouched", None), ("generation", {"gen": "0:0:other"}), ("closed", {"closed": True}),
+                              ("session", {"session": "another-session"})):
+            with self.subTest(label):
+                r = self.rig
+                r.tg(OWNER, "x " + label)
+                prompt = r.typed[-1]
+                r.submit()
+                nonce = shared.parse_envelope(prompt)[0]
+                if tamper:
+                    r.n1._commit(lambda st: st["nonces"][nonce].update(tamper))
+                r.bridge._tpos = 0                                     # the transcript is read again from the start
+                r.drain()
+                expected = 0 if tamper is None else 1
+                self.assertEqual(r.n1.snapshot()["nonces"][nonce]["replays"], expected, label)
+                r.end_turn()
+
     def test_the_second_appearance_is_refused_after_t2(self):
         r, prompt, nonce = self.second_appearance_refusals("t2")
         clock = Clock()
