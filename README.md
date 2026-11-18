@@ -378,7 +378,10 @@ How it works: Telegram and SSH/tmux are two entrances to ONE conversation; mixin
 waits. Every Telegram message is typed into the session at once, wrapped in a one-time envelope
 (`<a2t:N>...</a2t:N>`, N = 128 random bits, stored before typing, bound to the exact typed body). Claude orders its own
 queue; the transcript shows what it took: a `human` record, or, when it arrived during a running turn, an `attachment`
-of type `queued_command`. An exact envelope in either consumes the nonce; only a `human` record starts a new Telegram
+of type `queued_command`. One envelope with a matching body in either consumes the nonce (other text around it is terminal typing: mixing is allowed;
+two envelopes or a changed body are not Telegram input), and a second appearance of the same input (queued first, the
+`human` record when Claude runs it) is the same input, not a replay. A bridge tag that cannot be validated while a route is
+running stops that route, like input of another chat; only a `human` record starts a new Telegram
 route, a queued one never starts a new answer. Background tasks launched inside a Telegram route are bound to its chat.
 When the harness itself starts processing a completion (a `task-notification` user record) of a bound, valid, still
 authorised job, that record starts a result route for the job's own chat (durable claim first) and the agent's answer
@@ -389,11 +392,14 @@ The recipient belongs to the route: a message of another chat never takes over a
 queued INSIDE a running answer, Claude will very likely answer both in the same turn, so forwarding of that answer
 stops and both chats get one fixed line (a documented decision point; no option keeps both chats correct and fully
 delivered without the bridge waiting). In this mode one gate decides every send: a terminal turn forwards nothing, not
-even an explicit marker. If the state cannot be stored, the Telegram message is NOT typed into the session and the chat
+even an explicit marker. Authorisation is re-checked at every send, including the stored-reply drain; a stored result reply is bound to its job in
+the state file, so a confirmation after a restart or after the route ended still marks the job delivered (the existing
+outbox retry is unchanged; a lost acknowledgement can still duplicate a message, as before).
+If the state cannot be stored, the Telegram message is NOT typed into the session and the chat
 gets a fixed error; every injection is a single attempt; the terminal is never affected.
-`"shared_session_nonce_ttl"` (seconds, default 600) limits the time from typing a prompt to its
-appearance in the transcript; `"shared_session_job_ttl"` (default 86400) limits how long a bound task
-stays deliverable. State lives in one file next to the signal file (`shared_session_<tmux>.json`).
+`"shared_session_nonce_ttl"` (seconds, default 600) only cleans up a prompt whose typing never completed; a typed
+prompt may wait in Claude's own queue as long as it needs, bounded by `"shared_session_job_ttl"` (default 86400), which
+also limits how long a bound task stays deliverable. State lives in one file next to the signal file (`shared_session_<tmux>.json`).
 This is an operational correlation, not a security boundary: anyone who can already read or write the
 same account, tmux, transcript or state file can forge the envelope or the state. It is also checked
 only against synthetic transcripts, not against a live Claude Code session.

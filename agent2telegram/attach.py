@@ -271,7 +271,6 @@ class AttachBridge:
     _n1 = None                  # shared_session.SharedSession, None = off (the default)
     _n1_gate = None             # RLock: route changes of the transcript thread and the inbound thread
     _n1_last_rec = 0.0          # monotonic ts of the last transcript content (last-resort idle fallback)
-    _n1_sends = None            # outbox record id -> (job, chat): which stored reply is a result of which job
     _route = None               # shared_session.Route: THE routing state of the running turn (ON only)
 
     def __init__(self, cfg: Config, *, client: TelegramClient | None = None) -> None:
@@ -355,7 +354,6 @@ class AttachBridge:
                 self._signal.parent / f"shared_session_{_slug}.json",
                 nonce_ttl=cfg.shared_session_nonce_ttl, job_ttl=cfg.shared_session_job_ttl,
                 authorised=self._n1_chat_authorised)
-            self._n1_sends = {}
             self._n1.load()
             self._reader = shared.EnvelopeReader(self._reader)
         self._seen_tools: set = set()
@@ -999,8 +997,10 @@ class AttachBridge:
                 log.error("could not persist the outgoing reply, falling back to the old path: %s", e)
             else:
                 job = self._n1_job_now()
-                if job and chunks:
-                    self._n1_sends[record_id] = (job, target)   # confirmed (delivered) only when Telegram confirms
+                if job and (chunks or files):
+                    # persisted in the atomic state: a confirmation after a restart or after the route ended still
+                    # marks the job delivered (delivered only when Telegram confirms)
+                    self._n1.bind_send(record_id, job, target)
                 self._pending_files = []
                 if turn_text:
                     # For the backstop the reply is handled once it is durably stored.
@@ -1077,6 +1077,15 @@ class AttachBridge:
             # private reply into a group once a group message arrived in between (audit
             # 2026-10-10). Legacy records without a stored chat keep the old behaviour.
             chat = rec.chat if rec.chat is not None else self._legacy_chat()
+            if self._n1 is not None and not self._n1_chat_authorised(chat):
+                # Authorisation is checked at the moment of the send: a revoked chat gets nothing, and a result
+                # that was bound to a job is uncertain (never resent by us).
+                bound = self._n1.pop_send(rec.record_id)
+                if bound:
+                    self._n1.mark_uncertain(bound[0])
+                outbox.give_up(rec.record_id, "chat no longer authorised")
+                log.warning("shared session: stored reply not sent, chat no longer authorised")
+                continue
             # Parts already confirmed by Telegram are NOT resent — only the remaining ones.
             for index, chunk in rec.pending_chunks:
                 try:
@@ -1113,6 +1122,7 @@ class AttachBridge:
                         break
                     return
                 outbox.mark_file_sent(rec.record_id, file_path)
+                self._n1_confirm_record(rec.record_id)
             if gave_up:
                 continue          # the record is in dead-letter, the queue moves on
             if rec.key and not self._mark_sent(rec.key):
@@ -1666,6 +1676,8 @@ class AttachBridge:
         for attempt in range(1, attempts + 1):
             try:
                 self._session.inject(text, **extra)
+                if nonce:
+                    self._n1.mark_typed(nonce)      # from now on only T2 bounds its wait in Claude's own queue
                 if attempt > 1:
                     log.info("inject succeeded on attempt %d", attempt)
                 return True
@@ -1788,7 +1800,17 @@ class AttachBridge:
         """The ONE gate for everything that would go to Telegram: only a Telegram or claimed-result turn
         that was not cut, and only to the recipient stored with it."""
         r = self._route
-        return r.kind in ("tg", "notif") and not r.cut and (target is None or target == r.chat)
+        if r.kind not in ("tg", "notif") or r.cut or not (target is None or target == r.chat):
+            return False
+        if not self._n1_chat_authorised(r.chat):
+            # authorisation is re-checked at every send: a revoked chat cuts the route and a claimed result is uncertain
+            self._route.cut = True
+            self._turn_from_tg = False
+            if r.job:
+                self._n1.mark_uncertain(r.job)
+            log.warning("shared session: chat no longer authorised -> route stopped")
+            return False
+        return True
 
     def _n1_dropped(self, what: str) -> None:
         log.info("shared session: %s not forwarded (route=%s cut=%s)", what, self._route.kind, self._route.cut)
@@ -1821,7 +1843,7 @@ class AttachBridge:
 
     def _n1_confirm_record(self, record_id) -> None:
         """A part of a stored reply was CONFIRMED by Telegram: only now is a result job delivered."""
-        sent = self._n1_sends.pop(record_id, None) if self._n1_sends else None
+        sent = self._n1.pop_send(record_id) if self._n1 is not None else None
         if sent:
             self._n1_confirm(*sent)
 
@@ -1851,11 +1873,14 @@ class AttachBridge:
             self._n1_exit("no turn")
 
     def _n1_service_line(self, chat, text) -> None:
+        """One fixed line to a chat whose answer was stopped. Best effort: a failure is logged explicitly (the
+        forwarding stays stopped either way) and never reported as success."""
         if chat is not None:
             try:
                 self.tg.send_message(chat, text)
             except Exception as e:
-                log.warning("shared session: service line not sent: error=%s", type(e).__name__)
+                log.error("shared session: service line to chat %s NOT delivered (error=%s); forwarding stays stopped",
+                          chat, type(e).__name__)
 
     def _n1_enter_chat(self, chat_id) -> None:
         """Inbound message of ``chat_id``: injected at once, never waits. It does not change the recipient of a
@@ -2314,6 +2339,8 @@ class AttachBridge:
                 # A claimed result turn is started by the task-notification record itself: the Stop hook of THAT
                 # turn names this record as its prompt (the Stop of the previous turn names an older one).
                 return rec.get("uuid") == turn.get("uuid")
+            if turn and turn["kind"] == "tg" and rec.get("uuid") == turn.get("uuid"):
+                return True                          # the record that opened this route (also when text was mixed in)
         text = self._reader.user_text(rec)
         origins = getattr(self, "_origins", (self.cfg.origin_prefix.strip(), "Telegram:", "[TG]"))
         if not text or not text.lstrip().startswith(tuple(p for p in origins if p)):

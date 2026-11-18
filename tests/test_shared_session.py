@@ -474,7 +474,10 @@ class ReplayAndMixedTests(RigTestCase):
         r.submit()
         r.launch("t1")
         r.end_turn()
-        r.submit(env)                                                  # the envelope pasted into the terminal
+        r.submit(env)                                                  # the same input once more: idempotent
+        self.assertEqual(r.n1.turn()["kind"], "tg")
+        r.end_turn()
+        r.submit(env)                                                  # a THIRD appearance is a genuine replay
         nonce = shared.parse_envelope(env)[0]
         self.assertEqual(r.n1.snapshot()["nonces"][nonce]["replays"], 1)
         self.assertEqual(r.n1.turn()["kind"], "other")
@@ -487,14 +490,15 @@ class ReplayAndMixedTests(RigTestCase):
         r.end_turn()
         self.assertEqual(r.sent_to(OWNER), ["still delivered"])
 
-    def test_mixed_input_is_not_telegram_and_revokes_the_nonce(self):
+    def test_a_changed_body_or_two_envelopes_are_not_telegram_and_revoke_the_nonce(self):
         r = self.rig
-        for mangled in (lambda e: "draft " + e, lambda e: e + " trailing", lambda e: e.replace("‹/a2t:", "‹/a2t:X")):
+        for mangled in (lambda e: e.replace("‹/a2t:", "‹/a2t:X"), lambda e: e + e,
+                        lambda e: e.replace("Telegram:", "Telegram:tampered ")):
             with self.subTest():
                 r.tg(OWNER)
-                env = r.typed[-1]
-                r.submit(mangled(env))
-                nonce = shared.parse_envelope(env)[0]
+                prompt = r.typed[-1]
+                r.submit(mangled(prompt))
+                nonce = shared.parse_envelope(prompt)[0]
                 self.assertEqual(r.n1.snapshot()["nonces"][nonce]["state"], "revoked")
                 self.assertEqual(r.n1.turn()["kind"], "other")
                 self.assertFalse(r.bridge._turn_from_tg)
@@ -502,9 +506,23 @@ class ReplayAndMixedTests(RigTestCase):
                 self.assertIsNone(r.job("m-" + nonce[:5]))
                 r.say("must not be forwarded")
                 r.end_turn()
-                r.submit(env)                                          # a later exact copy cannot revive it
+                r.submit(prompt)                                       # a later exact copy cannot revive it
                 self.assertEqual(r.n1.turn()["kind"], "other")
         self.assertEqual(r.client.sent, [])
+
+    def test_exactly_one_envelope_among_terminal_typing_is_telegram_input(self):
+        r = self.rig
+        for number, mixed in enumerate((lambda e: "draft " + e, lambda e: e + " trailing",
+                                        lambda e: "before " + e + " after")):
+            with self.subTest():
+                r.tg(OWNER, "from telegram")
+                r.submit(mixed(r.typed[-1]))                           # mixing is allowed: one shared conversation
+                self.assertEqual(r.n1.turn()["kind"], "tg")
+                r.launch(f"mx-{number}")
+                self.assertEqual(r.job(f"mx-{number}"), "pending")
+                r.say("[tg] a common answer")
+                r.end_turn()
+        self.assertEqual(r.sent_to(OWNER), ["a common answer"] * 3)
 
     def test_terminal_text_before_a_queued_telegram_prompt_does_not_revoke_it(self):
         r = self.rig
@@ -515,15 +533,37 @@ class ReplayAndMixedTests(RigTestCase):
         self.assertEqual(r.n1.turn()["kind"], "tg")
         self.assertTrue(r.bridge._turn_from_tg)
 
-    def test_expired_nonce_is_not_consumed(self):
+    def test_a_typed_input_waiting_in_claudes_queue_is_consumed_after_eleven_minutes(self):
         r = self.rig
         clock = Clock()
         r.n1._clock = clock
         r.tg(OWNER)
-        clock.t += 601
+        r.tick()
+        clock.t += 660                                                 # 11 minutes in Claude's native queue
+        r.tick()
+        r.submit()
+        self.assertEqual(r.n1.turn()["kind"], "tg")
+        self.assertTrue(r.bridge._turn_from_tg)
+
+    def test_an_orphan_nonce_expires_only_at_the_long_bound(self):
+        r = self.rig
+        clock = Clock()
+        r.n1._clock = clock
+        r.tg(OWNER)
+        clock.t += 86401                                               # T2: nothing ever consumed it
+        r.tick()
         r.submit()
         self.assertEqual(r.n1.turn()["kind"], "other")
         self.assertFalse(r.bridge._turn_from_tg)
+
+    def test_a_nonce_whose_injection_never_completed_is_cleaned_up_after_t1(self):
+        r = self.rig
+        clock = Clock()
+        r.n1._clock = clock
+        nonce = r.n1.issue(OWNER, "0" * 64)                            # issued, never typed
+        clock.t += 601
+        r.tick()
+        self.assertEqual(r.n1.nonce_state(nonce), "expired")
 
     def test_job_ttl_expires_the_binding(self):
         r = self.rig

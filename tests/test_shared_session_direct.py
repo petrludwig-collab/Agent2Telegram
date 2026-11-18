@@ -14,6 +14,7 @@ result was dropped and the job became uncertain after T1 (see the A4 characteris
 import json
 import threading
 import unittest
+from unittest.mock import patch
 
 from agent2telegram import attach as attach_mod
 from agent2telegram import shared_session as shared
@@ -254,38 +255,110 @@ class ChatBPolicyTests(DirectCase):
 
 
 class QueuedEnvelopeChecksTests(DirectCase):
-    def test_a_foreign_nonce_in_a_queued_command_is_not_accepted(self):
+    def test_a_foreign_nonce_in_a_queued_command_is_not_accepted_and_cuts_the_running_route(self):
         r = self.rig
         r.tg_turn(OWNER)
+        r.launch("before")
         r.append(queued_command(shared.wrap_prompt(shared.new_nonce(), "Telegram:forged"), "q1"))
-        r.say("[tg] still the real turn")                              # unknown tag: no change of the route
+        r.drain()
+        self.assertTrue(r.bridge._route.cut, "unvalidated input never keeps forwarding open")
+        r.say("[tg] the answer may now contain content nobody can attribute")
+        r.launch("after")
         r.tick()
-        self.assertEqual(r.n1.turn()["kind"], "tg")
-        self.assertEqual(r.sent_to(OWNER), ["still the real turn"])
+        self.assertEqual(r.sent_to(OWNER), [shared.ROUTE_SWITCH_RUNNING])
+        self.assertIsNone(r.job("after"))
 
-    def test_a_replayed_expired_changed_or_mixed_envelope_is_not_accepted(self):
+    def test_every_unvalidatable_tagged_input_cuts_the_route_of_chat_a(self):
+        r = self.rig
+        r.tg(OWNER, "x")
+        replay_prompt = r.typed[-1]
+        r.submit()
+        r.end_turn()
+        r.tg(GROUP, "revoked")
+        revoked = r.typed[-1]
+        r.n1.cancel(shared.parse_envelope(revoked)[0])
+        r.tg(GROUP, "changed")
+        nonce, inner = shared.parse_envelope(r.typed[-1])
+        changed = shared.wrap_prompt(nonce, inner + " tampered")
+        r.tg(GROUP, "two")
+        two = r.typed[-1] * 2
+        for label, prompt in {"replayed twice": None, "revoked": revoked, "changed body": changed,
+                              "two envelopes": two}.items():
+            with self.subTest(label):
+                r.tg_turn(OWNER, "a new route of chat A")
+                if prompt is None:
+                    self.queue(replay_prompt)                          # second appearance: idempotent
+                    self.assertFalse(r.bridge._route.cut)
+                    self.queue(replay_prompt)                          # third: a genuine replay
+                else:
+                    self.queue(prompt)
+                self.assertTrue(r.bridge._route.cut, label)
+                r.end_turn()
+
+    def test_an_input_waiting_in_claudes_queue_for_eleven_minutes_is_still_attributed(self):
         r = self.rig
         clock = Clock()
         r.n1._clock = clock
-        r.tg(OWNER, "first")
-        prompt = r.typed[-1]
-        r.submit()
-        nonce = shared.parse_envelope(prompt)[0]
-        self.queue(prompt)                                             # replay of a consumed nonce
-        self.assertEqual(r.n1.snapshot()["nonces"][nonce]["replays"], 1)
-        r.tg(OWNER, "second")
-        expired = r.typed[-1]
-        clock.t += 601
-        self.queue(expired)
-        self.assertEqual(r.n1.nonce_state(shared.parse_envelope(expired)[0]), "expired")
-        r.tg(OWNER, "third")
-        n3, inner = shared.parse_envelope(r.typed[-1])
-        self.queue(shared.wrap_prompt(n3, inner + " tampered"))
-        self.assertEqual(r.n1.nonce_state(n3), "revoked")
-        r.tg(OWNER, "fourth")
-        mixed = r.typed[-1]
-        self.queue("draft " + mixed)
-        self.assertEqual(r.n1.nonce_state(shared.parse_envelope(mixed)[0]), "revoked")
+        r.tg_turn(OWNER, "a long turn")
+        self.assertTrue(r.tg(OWNER, "typed ahead, waits in Claude's queue"))
+        clock.t += 660
+        r.tick()
+        self.queue()
+        self.assertFalse(r.bridge._route.cut)
+        self.assertEqual(r.bridge._route.chat, OWNER)
+
+    def test_a_queued_envelope_among_terminal_typing_is_still_input_of_its_chat(self):
+        r = self.rig
+        r.terminal("typed over SSH")
+        self.assertTrue(r.tg(OWNER, "from Telegram"))
+        self.queue("terminal draft " + r.typed[-1])
+        self.assertEqual(r.bridge._route.kind, "tg")
+        r.say("[tg] common answer")
+        r.tick()
+        self.assertEqual(r.sent_to(OWNER), ["common answer"])
+
+    def test_queued_then_human_appearance_of_the_same_input_is_idempotent_both_orders(self):
+        r = self.rig
+        r.tg_turn(OWNER, "route A")
+        self.assertTrue(r.tg(GROUP, "chat B"))
+        prompt_b = r.typed[-1]
+        nonce_b = shared.parse_envelope(prompt_b)[0]
+        self.queue(prompt_b)                                           # queued first (cut of A)
+        self.assertTrue(r.bridge._route.cut)
+        r.submit(prompt_b)                                             # then Claude runs it: a human record
+        self.assertEqual(r.n1.snapshot()["nonces"][nonce_b]["replays"], 0, "same input, not a replay")
+        self.assertEqual(r.bridge._route.kind, "tg")
+        self.assertEqual(r.bridge._route.chat, GROUP, "B's own turn starts when Claude really runs its input")
+        r.say("[tg] B's own answer")
+        r.end_turn()                                                   # a group's final answer is sent at the turn end
+        self.assertEqual(r.sent_to(GROUP).count("B's own answer"), 1)
+        self.assertEqual(r.sent_to(GROUP).count(shared.ROUTE_SWITCH_QUEUED), 1, "the line is not repeated")
+        self.queue(prompt_b)                                           # a THIRD appearance is a genuine replay
+        self.assertEqual(r.n1.snapshot()["nonces"][nonce_b]["replays"], 1)
+        # reverse order: a human record first, the queued evidence afterwards
+        r.tg(OWNER, "second input")
+        prompt_2 = r.typed[-1]
+        nonce_2 = shared.parse_envelope(prompt_2)[0]
+        r.submit(prompt_2)
+        self.queue(prompt_2)
+        self.assertEqual(r.n1.snapshot()["nonces"][nonce_2]["replays"], 0)
+        self.queue(prompt_2)
+        self.assertEqual(r.n1.snapshot()["nonces"][nonce_2]["replays"], 1)
+
+    def test_a_service_line_that_cannot_be_sent_is_logged_and_the_route_stays_cut(self):
+        r = self.rig
+        r.tg_turn(OWNER, "chat A")
+        self.assertTrue(r.tg(GROUP, "chat B"))
+        real = r.client.send_message
+        r.client.send_message = lambda chat, text, parse_mode=None: (_ for _ in ()).throw(RuntimeError("network down"))
+        with self.assertLogs(attach_mod.log, level="ERROR") as logs:
+            self.queue()
+        r.client.send_message = real
+        self.assertTrue(any("NOT delivered" in line for line in logs.output), logs.output)
+        self.assertTrue(r.bridge._route.cut)
+        r.say("[tg] must stay withheld")
+        r.tick()
+        self.assertEqual(r.client.sent, [])
 
     def test_a_re_read_queued_record_after_a_restart_is_consumed_only_once(self):
         r = self.rig
@@ -455,6 +528,115 @@ class ResultRouteRulesTests(DirectCase):
         r.say(RESULT)
         r.tick()
         self.assertEqual(r.sent_to(OWNER), [RESULT])
+
+
+class PersistedSendBindingTests(DirectCase):
+    """The outbox record <-> job/chat binding lives in the atomic state (restart, route end, files)."""
+
+    def result_stored_but_unsent(self):
+        r = self.rig
+        r.tg_turn(OWNER, "A")
+        r.launch("tA")
+        r.end_turn()
+        r.notify("tA")
+        self.real_send = r.client.send_message
+        self.network = {"up": False}
+
+        def flaky(chat, text, parse_mode=None):
+            if not self.network["up"]:
+                raise RuntimeError("network down")
+            return self.real_send(chat, text, parse_mode)
+        r.client.send_message = flaky
+        r.say(RESULT)
+        r.tick()                                                       # enqueued and bound, the send fails
+        self.assertEqual(r.job("tA"), "claimed")
+        self.assertEqual(len(r.n1.snapshot()["sends"]), 1)
+
+    def test_a_crash_between_enqueue_and_confirmation_still_marks_the_job_delivered_after_the_restart(self):
+        r = self.rig
+        self.result_stored_but_unsent()
+        r.new_bridge()                                                 # crash/restart: memory is gone, the state is not
+        self.assertEqual(r.job("tA"), "uncertain", "the claim of a dead process is uncertain")
+        self.assertEqual(len(r.n1.snapshot()["sends"]), 1)
+        r.client.send_message = self.real_send
+        r.tick()                                                       # the existing outbox retry confirms
+        self.assertEqual(r.sent_to(OWNER).count(RESULT), 1)
+        self.assertEqual(r.job("tA"), "delivered")
+        self.assertEqual(r.n1.snapshot()["sends"], {})
+        typed = len(r.typed)
+        r.tick()
+        self.assertEqual(r.sent_to(OWNER).count(RESULT), 1, "our code never resends a result by itself")
+        self.assertEqual(len(r.typed), typed)
+
+    def test_a_confirmation_after_the_route_ended_marks_the_job_delivered(self):
+        r = self.rig
+        self.result_stored_but_unsent()
+        r.end_turn()
+        self.assertEqual(r.job("tA"), "uncertain")
+        self.network["up"] = True
+        r.tick()
+        self.assertEqual(r.job("tA"), "delivered")
+        self.assertEqual(r.sent_to(OWNER).count(RESULT), 1)
+
+    def test_a_result_that_is_only_a_file_is_confirmed_by_the_file_send(self):
+        r = self.rig
+        outbox_dir = r.bridge.cfg.path_outbox()
+        outbox_dir.mkdir(parents=True, exist_ok=True)
+        report = outbox_dir / "chart.txt"
+        report.write_text("synthetic attachment")
+        sent_files = []
+        r.client.send_file = lambda chat, path, *a, **k: sent_files.append((chat, str(path)))
+        r.tg_turn(OWNER, "A")
+        r.launch("tA")
+        r.end_turn()
+        r.notify("tA")
+        r.say(f"[tg] [tg-file] {report}")
+        r.tick()
+        r.tick()
+        self.assertEqual([c for c, _ in sent_files], [OWNER])
+        self.assertEqual(r.job("tA"), "delivered")
+
+
+class AuthorisationAtEverySendTests(DirectCase):
+    def test_authorisation_revoked_after_the_claim_stops_the_route_and_makes_the_job_uncertain(self):
+        r = self.rig
+        r.tg_turn(OWNER, "A")
+        r.launch("tA")
+        r.end_turn()
+        r.notify("tA")
+        r.bridge._allowed.discard(OWNER)
+        r.say(RESULT)
+        r.tick()
+        self.assertEqual(r.client.sent, [])
+        self.assertEqual(r.job("tA"), "uncertain")
+        self.assertEqual(r.bridge._route.kind, "none", "the dead job's route is released")
+
+    def test_authorisation_revoked_while_the_reply_waits_in_the_outbox_means_it_is_never_sent(self):
+        r = self.rig
+        r.tg_turn(OWNER, "A")
+        r.launch("tA")
+        r.end_turn()
+        r.notify("tA")
+        r.say(RESULT)                                                  # authorised at that moment: stored
+        r.bridge._allowed.discard(OWNER)
+        r.tick()                                                       # the drain re-checks at the send
+        r.tick()
+        self.assertEqual(r.client.sent, [])
+        self.assertEqual(r.job("tA"), "uncertain")
+        r.bridge._allowed.add(OWNER)                                   # even a later re-authorisation does not resend it
+        r.tick()
+        self.assertEqual(r.client.sent, [])
+
+    def test_files_and_a_normal_telegram_route_follow_the_same_check(self):
+        r = self.rig
+        r.tg_turn(OWNER, "A")
+        r.bridge._allowed.discard(OWNER)
+        with patch.object(r.bridge, "_safe_outbox_path") as safe:
+            r.bridge._send_files(["/tmp/x.txt"])
+        safe.assert_not_called()
+        r.say("[tg] a normal answer")
+        r.tick()
+        self.assertEqual(r.client.sent, [])
 
 
 if __name__ == "__main__":

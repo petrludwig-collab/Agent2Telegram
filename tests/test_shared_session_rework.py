@@ -138,14 +138,15 @@ class EnvelopeBodyTests(RigTestCase):
                 self.assertIsNone(r.job("x-" + nonce[:6]))
                 r.end_turn()
 
-    def test_prepended_appended_text_and_two_envelopes_are_rejected(self):
+    def test_prepended_or_appended_text_is_mixing_two_envelopes_are_not_telegram(self):
         r = self.rig
-        for build in (lambda t: "draft " + t, lambda t: t + " tail", lambda t: t + t):
-            with self.subTest():
-                typed = self.issue()
-                r.submit(build(typed))
-                self.assertEqual(r.n1.turn()["kind"], "other")
-                r.end_turn()
+        typed = self.issue()
+        r.submit("draft " + typed + " tail")                           # one envelope among terminal typing: consumed
+        self.assertEqual(r.n1.turn()["kind"], "tg")
+        r.end_turn()
+        typed = self.issue()
+        r.submit(typed + typed)                                        # two envelopes: not Telegram
+        self.assertEqual(r.n1.turn()["kind"], "other")
 
     def test_the_fingerprint_is_not_the_content_and_logs_carry_no_raw_text(self):
         r = self.rig

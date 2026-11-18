@@ -122,6 +122,23 @@ def parse_envelope(text: str):
     return m.group("n"), m.group("inner")
 
 
+_CLOSE_TAG = re.compile(f"{_L}/a2t:({_NONCE}){_R}")
+
+
+def find_envelope(text: str):
+    """``(nonce, inner, extra)`` when the text contains exactly ONE envelope (one open and one matching close tag, nothing
+    else that looks like a tag) anywhere in it; ``extra`` says that other text (terminal typing) is around it. Two
+    envelopes, a stray or mismatched tag, or no envelope give None."""
+    norm = normalise(text)
+    opens, closes = _OPEN_TAG.findall(norm), _CLOSE_TAG.findall(norm)
+    if len(opens) != 1 or len(closes) != 1 or opens[0] != closes[0] or len(_ANY_TAG.findall(norm)) != 2:
+        return None
+    m = re.search(f"{_L}a2t:({_NONCE}){_R}(?P<inner>.*?){_L}/a2t:\\1{_R}", norm, re.S)
+    if not m:
+        return None
+    return m.group(1), m.group("inner"), m.start() > 0 or m.end() < len(norm)
+
+
 def strip_envelope(text: str) -> str:
     """Display/legacy normalisation only (NEVER a trust decision): the payload of a well-formed envelope."""
     parsed = parse_envelope(text) if isinstance(text, str) else None
@@ -227,6 +244,8 @@ class Outcome:
     changed: bool = False        # the turn differs from the one before this record
     cut: bool = False            # forwarding of the running turn must stop now (fail closed)
     cut_chats: tuple = ()        # chats that get a fixed service line because of that cut
+    unvalidated: bool = False    # the record carried a bridge tag that could not be validated
+    again: bool = False          # a second appearance of an already consumed input (idempotent, not a replay)
 
 
 @dataclass
@@ -236,7 +255,7 @@ class Sync:
 
 
 def _fresh() -> dict:
-    return {"v": VERSION, "transcript": None, "turn": None, "nonces": {}, "jobs": {}}
+    return {"v": VERSION, "transcript": None, "turn": None, "nonces": {}, "jobs": {}, "sends": {}}
 
 
 def _validate(st) -> None:
@@ -371,6 +390,7 @@ class SharedSession:
                 self._s = _fresh()
                 self._reset_locked("invalid state file")
                 return
+            st.setdefault("sends", {})
             self._s = st
 
             def recover(new):
@@ -509,7 +529,7 @@ class SharedSession:
         def f(st):
             st["nonces"][nonce] = {"chat": chat, "state": "issued", "purpose": "inbound", "job": None,
                                    "session": st["transcript"]["session"], "at": now, "off": None,
-                                   "replays": 0, "fp": fp}
+                                   "replays": 0, "fp": fp, "typed": False, "appearances": 0, "offs": []}
         self._commit(f)
         return nonce
 
@@ -523,6 +543,56 @@ class SharedSession:
                 rec = st["nonces"][nonce]
                 if rec["state"] == "issued":
                     rec["state"], rec["at"] = "revoked", self._clock()
+            try:
+                self._commit(f)
+            except StateError:
+                pass
+
+    def mark_typed(self, nonce: str) -> None:
+        """The injection of this prompt completed: from now on only T2 (not T1) bounds its consumption."""
+        with self._lock:
+            if self._s is None or self.degraded is not None or nonce not in self._s["nonces"]:
+                return
+            try:
+                self._commit(lambda st: st["nonces"][nonce].update(typed=True))
+            except StateError:
+                pass
+
+    def bind_send(self, record_id: str, job: str, chat: int) -> None:
+        """Persist which stored outbox reply is a result of which job (survives a restart and the end of the route)."""
+        with self._lock:
+            if self._s is None or self.degraded is not None:
+                return
+            now = self._clock()
+            try:
+                self._commit(lambda st: st["sends"].update(
+                    {record_id: {"job": job, "chat": chat, "session": st["transcript"]["session"], "at": now}}))
+            except StateError:
+                pass
+
+    def pop_send(self, record_id: str):
+        """The (job, chat) a stored reply was bound to, removed from the state; None when it was not a result."""
+        with self._lock:
+            if self._s is None or self.degraded is not None:
+                return None
+            bound = self._s["sends"].get(record_id)
+            if not bound:
+                return None
+            try:
+                self._commit(lambda st: st["sends"].pop(record_id, None))
+            except StateError:
+                return None
+            return bound["job"], bound["chat"]
+
+    def mark_uncertain(self, task: str) -> None:
+        """A claimed result that must not be sent any more (authorisation gone) is uncertain, never resent by us."""
+        with self._lock:
+            job = (self._s or {}).get("jobs", {}).get(task)
+            if self.degraded is not None or not job or job["state"] != "claimed":
+                return
+
+            def f(st):
+                st["jobs"][task]["state"], st["jobs"][task]["at"] = "uncertain", self._clock()
             try:
                 self._commit(f)
             except StateError:
@@ -607,33 +677,45 @@ class SharedSession:
                 job["state"], job["at"] = "uncertain", now
 
     def _consume(self, st, offset, text, now, out):
-        """The consumption checks for an envelope in an input record (human or queued): exact envelope, issued,
-        body fingerprint, TTL, session; replay; mixed. Returns the consumed nonce or None."""
-        parsed = parse_envelope(text)
-        if parsed:
-            nonce = parsed[0]
-            nrec = st["nonces"].get(nonce)
-            if nrec and nrec["state"] == "issued":
-                if nrec.get("fp") != fingerprint(parsed[1]):
-                    # right tags, other body: not the prompt that was typed (edited, mixed, shortened)
-                    nrec["state"], nrec["at"] = "revoked", now
-                    log.warning("shared session: envelope body differs from the typed prompt -> not Telegram")
-                elif now - nrec["at"] <= self.nonce_ttl and nrec["session"] == st["transcript"]["session"]:
-                    return nonce
-                else:
-                    nrec["state"], nrec["at"] = "expired", now
-            elif nrec and nrec["state"] == "consumed":
-                if nrec.get("off") == offset:
-                    out.noop = True                       # this very record, re-read after a restart
-                    return None
-                nrec["replays"] = nrec.get("replays", 0) + 1
-                log.warning("shared session: replay of a consumed envelope (no binding through it)")
-        else:
-            for nonce in _OPEN_TAG.findall(text):         # mixed input: our tag inside other text
+        """The consumption checks for an envelope in an input record (human or queued). Returns the consumed nonce or
+        None. Exactly ONE envelope with a matching body may sit among other text (terminal typing: mixing is allowed);
+        two envelopes, a changed body, an unknown/revoked/expired nonce or a replay are not Telegram input.
+        ``out.unvalidated`` is set when the record carried a bridge tag that could not be validated."""
+        found = find_envelope(text)
+        if not found:
+            for nonce in _OPEN_TAG.findall(text):         # two envelopes / mangled tags: revoke what is still open
                 nrec = st["nonces"].get(nonce)
                 if nrec and nrec["state"] == "issued":
                     nrec["state"], nrec["at"] = "revoked", now
                     log.warning("shared session: mixed input -> envelope revoked")
+            out.unvalidated = bool(_ANY_TAG.search(text or ""))
+            return None
+        nonce, inner, _extra = found
+        nrec = st["nonces"].get(nonce)
+        if nrec and nrec["state"] == "issued":
+            if nrec.get("fp") != fingerprint(inner):
+                # right tags, other body: not the prompt that was typed (edited, shortened)
+                nrec["state"], nrec["at"] = "revoked", now
+                log.warning("shared session: envelope body differs from the typed prompt -> not Telegram")
+            elif now - nrec["at"] <= self.job_ttl and nrec["session"] == st["transcript"]["session"]:
+                # Bound by the session and the long orphan bound T2, NOT by T1: an input may wait in Claude's queue.
+                nrec["appearances"], nrec["offs"] = 1, [offset]
+                return nonce
+            else:
+                nrec["state"], nrec["at"] = "expired", now
+        elif nrec and nrec["state"] == "consumed":
+            if offset in nrec.get("offs", [nrec.get("off")]):
+                out.noop = True                           # this very record, re-read after a restart
+                return None
+            if nrec.get("fp") == fingerprint(inner) and nrec.get("appearances", 1) == 1:
+                # the SAME input once more (queued_command first, the human record when Claude runs it, or the reverse)
+                nrec["appearances"] = 2
+                nrec["offs"] = list(nrec.get("offs", [])) + [offset]
+                out.again = True
+                return nonce
+            nrec["replays"] = nrec.get("replays", 0) + 1
+            log.warning("shared session: replay of a consumed envelope (no binding through it)")
+        out.unvalidated = True
         return None
 
     def _on_human(self, st, offset, rec, out, kind) -> None:
@@ -648,31 +730,43 @@ class SharedSession:
         uuid = rec.get("uuid") if isinstance(rec.get("uuid"), str) else None
         if consumed:
             nrec = st["nonces"][consumed]
-            nrec["state"], nrec["off"] = "consumed", offset
+            nrec["state"], nrec["off"] = "consumed", nrec.get("off") if out.again else offset
             st["turn"] = {"kind": "tg", "chat": nrec["chat"], "nonce": consumed, "job": None, "uuid": uuid}
             return
         st["turn"] = {"kind": "other", "chat": None, "nonce": None, "job": None, "uuid": uuid}
 
     def _on_queued(self, st, offset, rec, out, kind) -> None:
-        """An attachment `queued_command` that carries a bridge envelope: Claude took that input while a turn
-        runs. The nonce is consumed here, but this is NOT a new answer, so the running route keeps its recipient:
-        same chat continues; no route yet (a terminal turn is running) starts one for that chat; ANOTHER chat
-        inside an active route never takes the route over: forwarding stops and both chats get one fixed line."""
+        """An attachment `queued_command` that carries a bridge tag: Claude took that input while a turn runs. A valid
+        envelope is consumed here, but this is NOT a new answer, so the running route keeps its recipient: same chat
+        continues; no route yet (a terminal turn is running) starts one for that chat; ANOTHER chat inside an active
+        route never takes the route over. A tag that cannot be validated (expired, revoked, unknown, replayed, two
+        envelopes, changed body) is input Claude has seen that we cannot attribute: an active route is cut as well."""
         now = self._clock()
         consumed = self._consume(st, offset, record_text(rec), now, out)
-        if out.noop or not consumed:
-            return                                        # no turn change for anything else
-        nrec = st["nonces"][consumed]
-        nrec["state"], nrec["off"] = "consumed", offset
+        if out.noop:
+            return
         turn = st["turn"]
+        active = turn is not None and turn["kind"] in ("tg", "notif")
+        if not consumed:
+            if out.unvalidated and active and not turn.get("cut"):
+                turn["cut"] = True
+                out.cut = True
+                out.cut_chats = (turn["chat"],)
+                log.warning("shared session: unvalidated bridge input inside a running answer -> forwarding stopped")
+            return
+        nrec = st["nonces"][consumed]
+        nrec["state"] = "consumed"
+        if not out.again:
+            nrec["off"] = offset
         uuid = rec.get("uuid") if isinstance(rec.get("uuid"), str) else None
-        if turn is None or turn["kind"] == "other":
-            st["turn"] = {"kind": "tg", "chat": nrec["chat"], "nonce": consumed, "job": None, "uuid": uuid}
+        if not active:
+            if turn is None or turn["kind"] == "other":
+                st["turn"] = {"kind": "tg", "chat": nrec["chat"], "nonce": consumed, "job": None, "uuid": uuid}
         elif turn["chat"] != nrec["chat"]:
             was_cut = bool(turn.get("cut"))
             turn["cut"] = True
             out.cut = True
-            out.cut_chats = (nrec["chat"],) if was_cut else (turn["chat"], nrec["chat"])
+            out.cut_chats = () if out.again else ((nrec["chat"],) if was_cut else (turn["chat"], nrec["chat"]))
             log.warning("shared session: input of another chat inside a running answer -> forwarding stopped")
 
     def _on_tool_result(self, st, offset, rec, out, kind) -> None:
@@ -766,7 +860,10 @@ class SharedSession:
 
             def f(st):
                 for rec in st["nonces"].values():
-                    if rec["state"] == "issued" and now - rec["at"] > t1:
+                    # T1 only cleans up nonces whose injection was never completed; a typed input may wait in Claude's
+                    # own queue for as long as it likes, bounded only by the orphan bound T2.
+                    limit = t2 if rec.get("typed") else t1
+                    if rec["state"] == "issued" and now - rec["at"] > limit:
                         rec["state"], rec["at"] = "expired", now
                 for job in st["jobs"].values():
                     if job["state"] == "pending" and now - job["bound_at"] > t2:
@@ -779,6 +876,8 @@ class SharedSession:
                     st["turn"] = None                         # its job is dead: the turn ends with it
                 for n in [n for n, r in st["nonces"].items() if r["state"] != "issued" and now - r["at"] > 2 * t2]:
                     del st["nonces"][n]
+                for rid in [k for k, v in st["sends"].items() if now - v["at"] > 2 * t2]:
+                    del st["sends"][rid]
                 for tid in [k for k, j in st["jobs"].items()
                             if j["state"] not in ("pending", "claimed") and now - j["at"] > 2 * t2]:
                     del st["jobs"][tid]
