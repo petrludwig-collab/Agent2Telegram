@@ -731,6 +731,30 @@ class PartialAuthorisationTests(DirectCase):
         r.bridge._send_files([str(f) for f in files])
         self.assertEqual(sent_files, ["one.txt"])
 
+    def test_authorisation_revoked_between_two_stored_files_stops_the_second_in_the_outbox_drain(self):
+        r = self.rig
+        outbox_dir = r.bridge.cfg.path_outbox()
+        outbox_dir.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for name in ("one.txt", "two.txt"):
+            (outbox_dir / name).write_text(name)
+            paths.append(outbox_dir / name)
+        sent_files = []
+
+        def send_file(chat, path, *a, **k):
+            sent_files.append(Path(path).name)
+            r.bridge._allowed.discard(OWNER)
+        r.client.send_file = send_file
+        r.tg_turn(OWNER, "A")
+        r.launch("tA")
+        r.end_turn()
+        r.notify("tA")
+        r.say(f"[tg] [tg-file] {paths[0]}\n[tg-file] {paths[1]}")
+        r.tick()
+        r.tick()
+        self.assertEqual(sent_files, ["one.txt"])
+        self.assertEqual(r.job("tA"), "delivered", "the first file was confirmed before the revocation")
+
     def test_no_service_line_or_refusal_goes_to_a_chat_that_is_no_longer_authorised(self):
         r = self.rig
         r.tg_turn(OWNER, "chat A")
