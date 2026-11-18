@@ -16,7 +16,7 @@ from unittest.mock import patch
 from agent2telegram import attach as attach_mod
 from agent2telegram import shared_session as shared
 
-from n1_rig import OWNER, GROUP, RigTestCase, assistant
+from n1_rig import OWNER, GROUP, RigTestCase
 
 RESULT = "RESULT-A4 synthetic result text"
 
