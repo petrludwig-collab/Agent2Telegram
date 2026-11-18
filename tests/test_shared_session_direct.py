@@ -153,11 +153,24 @@ class DirectInputTests(DirectCase):
         done, result = self.handle_async(GROUP, "chat B talks meanwhile")
         self.assertTrue(done.wait(2), "chat B must not wait for chat A's turn")
         self.assertEqual(len(r.typed), typed + 1)
+        self.assertEqual(r.bridge._owner_chat, OWNER, "B's message does not take over the running route at once")
         r.say("[tg] A's answer, still being written")
         r.tick()
         self.assertEqual(r.sent_to(OWNER), ["A's answer, still being written"])
         self.assertEqual(r.sent_to(GROUP), [])
         self.assertEqual(r.bridge._owner_chat, OWNER)
+
+    def test_typing_ahead_does_not_break_the_stop_hook_of_the_running_route(self):
+        r = self.rig
+        r.bridge._idle_limit = lambda: 10 ** 9
+        r.tg_turn(OWNER, "first")
+        r.say("[tg] answer")
+        self.assertTrue(r.tg(OWNER, "typed ahead"))
+        self.queue()
+        r.stop()
+        r.tick()
+        self.assertEqual(r.bridge._route.kind, "none", "the hook still names the prompt of the running route")
+        self.assertIsNone(r.n1.turn())
 
     def test_no_correctness_depends_on_the_idle_fallback(self):
         r = self.rig
