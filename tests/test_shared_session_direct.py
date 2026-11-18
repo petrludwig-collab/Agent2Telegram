@@ -117,6 +117,8 @@ class A4ResultTests(DirectCase):
         self.a4_until_result_route()
         r.say(RESULT)
         r.notify("job-a4")
+        self.assertEqual(r.bridge._route.kind, "notif", "the repeat is not a new boundary")
+        self.assertEqual(r.job("job-a4"), "claimed", "and not an interruption either")
         r.say("second answer to the repeat")
         r.tick()
         self.assertEqual(r.sent_to(OWNER).count(RESULT), 1)
