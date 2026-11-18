@@ -777,6 +777,65 @@ class ScanQueuesBounded(unittest.TestCase):
         self.assertEqual(found, [str(self.legacy)])
 
 
+class QueueLocationFollowsTheWriter(Base):
+    """signal_file in directory A, state_dir in a different directory B. The REAL default-mode
+    writer (``_send_final`` with a failing send) decides where the pending record lands; the
+    explicit-only start preflight must look at that same place."""
+
+    def setUp(self):
+        super().setUp()
+        self.sig = self.root / "sigdir"
+        self.sig.mkdir()
+        self.other_state = self.root / "otherstate"
+        self.other_state.mkdir()
+
+    def writer_bridge(self):
+        class Failing(Recorder):
+            def send_message(self, *a, **k): raise OSError("network down")
+        self.rec = Failing()
+        b = AttachBridge(self.cfg(explicit_only_outbound=False, signal_file=str(self.sig / "answer.txt"),
+                                  state_dir=str(self.other_state)), client=self.rec)
+        b._session = FakeSession()
+        return b
+
+    def pending_files(self):
+        return sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*")
+                      if p.is_file() and ("queue" in str(p.relative_to(self.root))))
+
+    def test_durable_record_written_by_the_default_writer_blocks_the_explicit_start(self):
+        w = self.writer_bridge()
+        w._send_final("old answer that never reached Telegram", key="k1")
+        written = self.pending_files()
+        self.assertTrue(written, "the real writer persisted nothing")
+        self.assertTrue(all(f.startswith("sigdir/queue/") for f in written), written)
+        self.assertFalse((self.other_state / "queue").exists())
+        self.refuses_start(written)
+
+    def test_legacy_file_written_by_the_default_writer_blocks_the_explicit_start(self):
+        w = self.writer_bridge()
+        w._pending_send = [{"text": "old", "key": None}]
+        w._persist_queue()
+        legacy = self.sig / "outbound_queue_t.jsonl"
+        self.assertTrue(legacy.is_file())
+        self.refuses_start([str(legacy.relative_to(self.root))])
+
+    def refuses_start(self, written):
+        rec = Recorder()
+        b = AttachBridge(self.cfg(signal_file=str(self.sig / "answer.txt"),
+                                  state_dir=str(self.other_state)), client=rec)
+        b._session = FakeSession()
+        before = snapshot(self.root)
+        b._stop.set()
+        with self.assertRaises(op.OutboundQueuePresent) as cm:
+            b._run_locked()
+        self.assertIn("sigdir", str(cm.exception))
+        self.assertEqual(snapshot(self.root), before, "nothing deleted, moved or touched")
+        self.assertEqual(rec.calls, [], "nothing sent, not even polled")
+        self.assertEqual(self.net, [])
+        for rel in written:                             # byte-identical, same place
+            self.assertTrue((self.root / rel).is_file())
+
+
 class ServiceErrorsOffParity(Base):
     """Flag off: the same four failures keep their ORIGINAL (richer) wording. Runs unchanged on
     the base SHA."""
