@@ -64,21 +64,22 @@ TURN_KINDS = ("tg", "notif", "other")
 #: Fixed text sent to the authorised inbound chat when a prompt is refused (R8). No dynamic content.
 REFUSED_TEXT = ("\u26a0\ufe0f This message was NOT passed to the agent: the bridge cannot store the state it "
                 "needs to track Telegram work safely. Please try again later.")
-#: Fixed service line to the turn's chat when forwarding of a turn is cut off (fail closed).
-CUT_TEXT = ("\u26a0\ufe0f The rest of this answer was withheld for safety: a background result that does "
-            "not belong to this chat arrived during the turn.")
-#: Fixed prompt for a deferred completion (the agent already saw the notification elsewhere).
-REPORT_PROMPT = "Background task {task} has finished. Report its result to the user."
+#: Fixed service lines when a queued input of ANOTHER chat arrives inside a running answer. Claude will very likely
+#: answer both in the same turn, so the bridge stops forwarding that answer instead of guessing a recipient.
+ROUTE_SWITCH_RUNNING = ("\u26a0\ufe0f This answer continues in the shared session together with a message of another chat "
+                        "and is not forwarded here any further.")
+ROUTE_SWITCH_QUEUED = ("\u26a0\ufe0f Your message was queued behind an answer for another chat. Its reply continues in the "
+                       "shared session and is not forwarded to this chat.")
 
 
 class Route:
-    """The routing state of the running turn on the bridge side. kind: none | pending (a report prompt was
-    typed, its envelope not yet consumed) | tg | notif | other. Only tg and notif that are not cut forward."""
+    """The routing state of the running turn on the bridge side. kind: none | tg | notif | other. Only tg and
+    notif that are not cut forward, and only to ``chat``."""
     __slots__ = ("kind", "chat", "job", "nonce", "cut", "prev_owner")
 
     def __init__(self, kind="none", chat=None, job=None, nonce=None, cut=False, prev_owner=None):
-        self.kind, self.chat, self.job, self.nonce = kind, chat, job, nonce
-        self.cut, self.prev_owner = cut, prev_owner
+        self.kind, self.chat, self.job, self.nonce, self.cut = kind, chat, job, nonce, cut
+        self.prev_owner = prev_owner                      # the owner chat a result route borrowed the variable from
 
 
 class StateError(Exception):
@@ -156,12 +157,30 @@ def _origin_kind(rec: dict):
     return origin.get("kind") if isinstance(origin, dict) else None
 
 
+def _queued_prompt(rec):
+    """Claude Code records input that arrives WHILE a turn runs (typed or injected) as an `attachment` of type
+    `queued_command`, not as a user record. Its prompt, or None when the record is not such an attachment."""
+    att = rec.get("attachment")
+    if rec.get("type") == "attachment" and isinstance(att, dict) and att.get("type") == "queued_command":
+        prompt = att.get("prompt")
+        return prompt if isinstance(prompt, str) else None
+    return None
+
+
 def record_text(rec: dict) -> str:
+    queued = _queued_prompt(rec)
+    if queued is not None:
+        return queued
     return readers._text_of((rec.get("message") or {}).get("content"))
 
 
 def classify(rec) -> str:
-    """ignore | tool_result | human | notification | foreign — from the record's own structure."""
+    """ignore | tool_result | human | queued | notification | foreign — from the record's own structure."""
+    queued = _queued_prompt(rec) if isinstance(rec, dict) else None
+    if queued is not None:
+        # A queued command that carries our tag is the evidence that Claude took that input (consumption); it is
+        # NOT the start of a new answer. One WITHOUT our tag is ignored (terminal text mixed into the turn is allowed).
+        return "queued" if _ANY_TAG.search(queued) else "ignore"
     if not isinstance(rec, dict) or rec.get("type") != "user":
         return "ignore"
     reader = readers.ClaudeCodeReader
@@ -207,6 +226,7 @@ class Outcome:
     noop: bool = False           # the same record was already applied before a restart
     changed: bool = False        # the turn differs from the one before this record
     cut: bool = False            # forwarding of the running turn must stop now (fail closed)
+    cut_chats: tuple = ()        # chats that get a fixed service line because of that cut
 
 
 @dataclass
@@ -216,7 +236,7 @@ class Sync:
 
 
 def _fresh() -> dict:
-    return {"v": VERSION, "transcript": None, "turn": None, "nonces": {}, "jobs": {}, "completions": []}
+    return {"v": VERSION, "transcript": None, "turn": None, "nonces": {}, "jobs": {}}
 
 
 def _validate(st) -> None:
@@ -230,18 +250,15 @@ def _validate(st) -> None:
                        and isinstance(t.get("head"), str) and isinstance(t.get("session"), str)))
     turn = st.get("turn")
     need(turn is None or (isinstance(turn, dict) and turn.get("kind") in TURN_KINDS))
-    need(isinstance(st.get("nonces"), dict) and isinstance(st.get("jobs"), dict)
-         and isinstance(st.get("completions"), list))
+    need(isinstance(st.get("nonces"), dict) and isinstance(st.get("jobs"), dict))
     for n, rec in st["nonces"].items():
         need(re.fullmatch(_NONCE, str(n)) and isinstance(rec, dict) and rec.get("state") in NONCE_STATES
-             and rec.get("purpose") in ("inbound", "report") and type(rec.get("chat")) is int
+             and rec.get("purpose") == "inbound" and type(rec.get("chat")) is int
              and isinstance(rec.get("at"), (int, float)) and isinstance(rec.get("session"), str))
     for tid, job in st["jobs"].items():
         need(_TASK_ID.fullmatch(str(tid)) and isinstance(job, dict) and job.get("state") in JOB_STATES
              and type(job.get("chat")) is int and isinstance(job.get("bound_at"), (int, float))
              and isinstance(job.get("at"), (int, float)) and isinstance(job.get("session"), str))
-    for c in st["completions"]:
-        need(isinstance(c, dict) and isinstance(c.get("task"), str) and type(c.get("offset")) is int)
 
 
 def _identity(path: Path) -> dict | None:
@@ -260,13 +277,12 @@ def _identity(path: Path) -> dict | None:
 
 class SharedSession:
     def __init__(self, path, *, nonce_ttl: float = DEFAULT_NONCE_TTL, job_ttl: float = DEFAULT_JOB_TTL,
-                 clock=time.time, authorised=lambda chat: True, busy=lambda: False) -> None:
+                 clock=time.time, authorised=lambda chat: True) -> None:
         self.path = Path(path)
         self.nonce_ttl = float(nonce_ttl)
         self.job_ttl = float(job_ttl)
         self._clock = clock
         self._authorised = authorised
-        self._busy = busy
         self._lock = threading.RLock()
         self._s: dict | None = None
         self.degraded: str | None = None
@@ -472,7 +488,6 @@ class SharedSession:
                 job["state"], job["at"] = "revoked", now
             elif job["state"] == "claimed":
                 job["state"], job["at"] = "uncertain", now
-        st["completions"] = []
         st["turn"] = None
         adopt(st)
 
@@ -481,9 +496,9 @@ class SharedSession:
         """Store a new one-time nonce for ``chat`` BEFORE the prompt is typed. Raises StateError when it
         cannot be stored safely; the caller must then not inject."""
         with self._lock:
-            return self._issue_locked(chat, "inbound", None, fp)
+            return self._issue_locked(chat, fp)
 
-    def _issue_locked(self, chat, purpose, job, fp) -> str:
+    def _issue_locked(self, chat, fp) -> str:
         if self.degraded is not None or self._s is None or self._s["transcript"] is None:
             raise StateError("state not usable")
         if type(chat) is not int:
@@ -492,7 +507,7 @@ class SharedSession:
         now = self._clock()
 
         def f(st):
-            st["nonces"][nonce] = {"chat": chat, "state": "issued", "purpose": purpose, "job": job,
+            st["nonces"][nonce] = {"chat": chat, "state": "issued", "purpose": "inbound", "job": None,
                                    "session": st["transcript"]["session"], "at": now, "off": None,
                                    "replays": 0, "fp": fp}
         self._commit(f)
@@ -508,12 +523,6 @@ class SharedSession:
                 rec = st["nonces"][nonce]
                 if rec["state"] == "issued":
                     rec["state"], rec["at"] = "revoked", self._clock()
-                job = st["jobs"].get(rec.get("job") or "")
-                if rec["purpose"] == "report" and job and job["state"] == "claimed":
-                    job["state"], job["at"] = "uncertain", self._clock()
-                    turn = st["turn"]
-                    if turn and turn["kind"] == "notif" and turn.get("job") == rec["job"]:
-                        st["turn"] = None                 # the result turn ends with its job
             try:
                 self._commit(f)
             except StateError:
@@ -530,7 +539,7 @@ class SharedSession:
                 return Outcome(turn=self.turn())
             new = copy.deepcopy(self._s)
             out = Outcome()
-            handler = {"human": self._on_human, "foreign": self._on_human,
+            handler = {"human": self._on_human, "foreign": self._on_human, "queued": self._on_queued,
                        "tool_result": self._on_tool_result, "notification": self._on_notification}[kind]
             handler(new, offset, rec, out, kind)
             out.turn = dict(new["turn"]) if new["turn"] else None
@@ -589,16 +598,18 @@ class SharedSession:
             except StateError:
                 pass
 
-    def _on_human(self, st, offset, rec, out, kind) -> None:
-        now = self._clock()
+    def _end_route(self, st, now) -> None:
+        """A turn boundary: a result route that ends without a confirmed send is uncertain (R5, never retried)."""
         prev = st["turn"]
-        if prev and prev["kind"] == "notif":              # a result turn was interrupted: R5, not retried
+        if prev and prev["kind"] == "notif":
             job = st["jobs"].get(prev.get("job") or "")
             if job and job["state"] == "claimed":
                 job["state"], job["at"] = "uncertain", now
-        text = record_text(rec) if kind == "human" else ""
-        consumed = None
-        parsed = parse_envelope(text) if kind == "human" else None
+
+    def _consume(self, st, offset, text, now, out):
+        """The consumption checks for an envelope in an input record (human or queued): exact envelope, issued,
+        body fingerprint, TTL, session; replay; mixed. Returns the consumed nonce or None."""
+        parsed = parse_envelope(text)
         if parsed:
             nonce = parsed[0]
             nrec = st["nonces"].get(nonce)
@@ -606,42 +617,63 @@ class SharedSession:
                 if nrec.get("fp") != fingerprint(parsed[1]):
                     # right tags, other body: not the prompt that was typed (edited, mixed, shortened)
                     nrec["state"], nrec["at"] = "revoked", now
-                    mjob = st["jobs"].get(nrec.get("job") or "")
-                    if nrec["purpose"] == "report" and mjob and mjob["state"] == "claimed":
-                        mjob["state"], mjob["at"] = "uncertain", now
                     log.warning("shared session: envelope body differs from the typed prompt -> not Telegram")
                 elif now - nrec["at"] <= self.nonce_ttl and nrec["session"] == st["transcript"]["session"]:
-                    consumed = nonce
+                    return nonce
                 else:
                     nrec["state"], nrec["at"] = "expired", now
             elif nrec and nrec["state"] == "consumed":
                 if nrec.get("off") == offset:
                     out.noop = True                       # this very record, re-read after a restart
-                    return
+                    return None
                 nrec["replays"] = nrec.get("replays", 0) + 1
                 log.warning("shared session: replay of a consumed envelope (no binding through it)")
-        elif kind == "human":
+        else:
             for nonce in _OPEN_TAG.findall(text):         # mixed input: our tag inside other text
                 nrec = st["nonces"].get(nonce)
                 if nrec and nrec["state"] == "issued":
                     nrec["state"], nrec["at"] = "revoked", now
-                    mjob = st["jobs"].get(nrec.get("job") or "")
-                    if nrec["purpose"] == "report" and mjob and mjob["state"] == "claimed":
-                        mjob["state"], mjob["at"] = "uncertain", now      # same transaction
-                    log.warning("shared session: mixed input -> envelope revoked, turn is not Telegram")
+                    log.warning("shared session: mixed input -> envelope revoked")
+        return None
+
+    def _on_human(self, st, offset, rec, out, kind) -> None:
+        """A user record: a turn boundary. An exact bridge envelope starts a Telegram route, anything else is
+        terminal (no route)."""
+        now = self._clock()
+        text = record_text(rec) if kind == "human" else ""
+        consumed = self._consume(st, offset, text, now, out) if kind == "human" else None
+        if out.noop:
+            return
+        self._end_route(st, now)
         uuid = rec.get("uuid") if isinstance(rec.get("uuid"), str) else None
         if consumed:
             nrec = st["nonces"][consumed]
-            job = st["jobs"].get(nrec.get("job") or "")
             nrec["state"], nrec["off"] = "consumed", offset
-            if nrec["purpose"] == "inbound":
-                st["turn"] = {"kind": "tg", "chat": nrec["chat"], "nonce": consumed, "job": None, "uuid": uuid}
-                return
-            if job and job["state"] == "claimed":
-                st["turn"] = {"kind": "notif", "chat": nrec["chat"], "nonce": consumed,
-                              "job": nrec["job"], "uuid": uuid}
-                return
+            st["turn"] = {"kind": "tg", "chat": nrec["chat"], "nonce": consumed, "job": None, "uuid": uuid}
+            return
         st["turn"] = {"kind": "other", "chat": None, "nonce": None, "job": None, "uuid": uuid}
+
+    def _on_queued(self, st, offset, rec, out, kind) -> None:
+        """An attachment `queued_command` that carries a bridge envelope: Claude took that input while a turn
+        runs. The nonce is consumed here, but this is NOT a new answer, so the running route keeps its recipient:
+        same chat continues; no route yet (a terminal turn is running) starts one for that chat; ANOTHER chat
+        inside an active route never takes the route over: forwarding stops and both chats get one fixed line."""
+        now = self._clock()
+        consumed = self._consume(st, offset, record_text(rec), now, out)
+        if out.noop or not consumed:
+            return                                        # no turn change for anything else
+        nrec = st["nonces"][consumed]
+        nrec["state"], nrec["off"] = "consumed", offset
+        turn = st["turn"]
+        uuid = rec.get("uuid") if isinstance(rec.get("uuid"), str) else None
+        if turn is None or turn["kind"] == "other":
+            st["turn"] = {"kind": "tg", "chat": nrec["chat"], "nonce": consumed, "job": None, "uuid": uuid}
+        elif turn["chat"] != nrec["chat"]:
+            was_cut = bool(turn.get("cut"))
+            turn["cut"] = True
+            out.cut = True
+            out.cut_chats = (nrec["chat"],) if was_cut else (turn["chat"], nrec["chat"])
+            log.warning("shared session: input of another chat inside a running answer -> forwarding stopped")
 
     def _on_tool_result(self, st, offset, rec, out, kind) -> None:
         task = launch_task_id(rec)
@@ -668,101 +700,59 @@ class SharedSession:
         return True
 
     def _on_notification(self, st, offset, rec, out, kind) -> None:
+        """The harness writes the completion when it STARTS processing it: a turn boundary. A bound, valid, authorised
+        job starts a result route for ITS OWN chat (durable claim first); anything else is terminal-only."""
         now = self._clock()
         task = notification_task_id(record_text(rec))
         job = st["jobs"].get(task or "")
         turn = st["turn"]
+        if turn and turn["kind"] == "notif" and turn.get("job") == task:
+            out.noop = True                               # a repeat inside its own route: nothing changes
+            return
         uuid = rec.get("uuid") if isinstance(rec.get("uuid"), str) else None
+        self._end_route(st, now)
         other = {"kind": "other", "chat": None, "nonce": None, "job": None, "uuid": uuid}
-        defer = {"task": task, "offset": offset, "seen_at": now}
-        if turn is not None:
-            self._notification_in_turn(st, out, turn, task, job, defer, now)
-            return
         if not self._valid_pending(st, job, now):
-            st["turn"] = other                            # the harness started a turn that is not ours
-            return
-        if st["completions"] or self._busy():             # older deferred ones first (FIFO) / nothing may overlap
-            if not any(c["task"] == task for c in st["completions"]):
-                st["completions"].append(defer)
-            st["turn"] = other
+            st["turn"] = other                            # terminal / unbound / expired / foreign / already claimed
             return
         if not self._authorised(job["chat"]):
             job["state"], job["at"] = "blocked", now
             st["turn"] = other
             log.warning("shared session: chat no longer authorised -> result not delivered")
             return
-        job["state"], job["at"] = "claimed", now          # durable intention BEFORE the turn is opened
+        job["state"], job["at"] = "claimed", now          # durable claim BEFORE anything is forwarded
         st["turn"] = {"kind": "notif", "chat": job["chat"], "nonce": None, "job": task, "uuid": uuid}
         out.claim = {"task": task, "chat": job["chat"], "uuid": uuid}
 
-    def _notification_in_turn(self, st, out, turn, task, job, defer, now) -> None:
-        """A completion arrives while a turn runs. Nothing is EVER marked delivered here: a still-pending
-        job stays deferred (FIFO) for its own report turn. In a bridge-owned turn (tg / notif) the rest of the
-        turn's forwarding is cut off, because the agent may now talk about that result and a report would
-        follow (a second logical delivery). The cut also closes the binding window."""
-        pending = self._valid_pending(st, job, now)
-        if pending and not any(c["task"] == task for c in st["completions"]):
-            st["completions"].append(defer)
-        if turn["kind"] == "other" or turn.get("cut"):
-            return
-        turn["cut"] = True                                # ANY notification, a repeat of the reported job included
-        out.cut = True
-        log.warning("shared session: completion inside a Telegram turn -> forwarding cut off")
-
-    # ---- turn end, deferred claims, expiry ----------------------------------
-    def turn_end(self, *, text_sent: bool) -> None:
+    # ---- turn end, confirmed sends, expiry -----------------------------------
+    def turn_end(self) -> None:
+        """The Stop hook (or the last-resort idle fallback) ended the turn. A result route that never had a confirmed
+        send is uncertain; `delivered` is only ever set by :meth:`confirm_delivered`."""
         with self._lock:
             if self._s is None or self.degraded is not None or self._s["turn"] is None:
                 return
 
             def f(st):
-                turn = st["turn"]
-                job = st["jobs"].get(turn.get("job") or "")
-                if turn["kind"] == "notif" and job and job["state"] == "claimed":
-                    job["state"], job["at"] = ("delivered" if text_sent else "uncertain"), self._clock()
+                self._end_route(st, self._clock())
                 st["turn"] = None
             try:
                 self._commit(f)
             except StateError:
                 pass
 
-    def claim_deferred(self, fingerprint_of=None) -> dict | None:
-        """The oldest deferred completion that is still valid, claimed in ONE write together with the
-        one-time envelope of its report prompt. None when nothing may be claimed now."""
+    def confirm_delivered(self, task: str, chat: int) -> None:
+        """Telegram CONFIRMED a send of a result text of ``task`` to ``chat``."""
         with self._lock:
-            if (self._s is None or self.degraded is not None or self._s["turn"] is not None
-                    or self._busy() or not self._s["completions"]):
-                return None
-            now = self._clock()
-            result: dict = {}
+            job = (self._s or {}).get("jobs", {}).get(task)
+            if self.degraded is not None or not job or job["chat"] != chat or job["state"] not in ("claimed", "uncertain"):
+                return
 
             def f(st):
-                keep = []
-                for c in st["completions"]:
-                    job = st["jobs"].get(c["task"])
-                    if result or not job or job["state"] != "pending":
-                        if result and job and job["state"] == "pending":
-                            keep.append(c)
-                        continue
-                    if not self._valid_pending(st, job, now):
-                        continue
-                    if not self._authorised(job["chat"]):
-                        job["state"], job["at"] = "blocked", now
-                        log.warning("shared session: chat no longer authorised -> result not delivered")
-                        continue
-                    nonce = new_nonce()
-                    st["nonces"][nonce] = {"chat": job["chat"], "state": "issued", "purpose": "report",
-                                           "job": c["task"], "session": st["transcript"]["session"],
-                                           "at": now, "off": None, "replays": 0,
-                                           "fp": fingerprint_of(c["task"]) if fingerprint_of else None}
-                    job["state"], job["at"] = "claimed", now
-                    result.update(task=c["task"], chat=job["chat"], nonce=nonce)
-                st["completions"] = keep
+                st["jobs"][task]["state"], st["jobs"][task]["at"] = "delivered", self._clock()
             try:
                 self._commit(f)
             except StateError:
-                return None
-            return dict(result) if result else None
+                pass
 
     def expire(self) -> None:
         with self._lock:
@@ -778,19 +768,15 @@ class SharedSession:
                 for rec in st["nonces"].values():
                     if rec["state"] == "issued" and now - rec["at"] > t1:
                         rec["state"], rec["at"] = "expired", now
-                        job = st["jobs"].get(rec.get("job") or "")
-                        if rec["purpose"] == "report" and job and job["state"] == "claimed":
-                            job["state"], job["at"] = "uncertain", now
                 for job in st["jobs"].values():
                     if job["state"] == "pending" and now - job["bound_at"] > t2:
                         job["state"], job["at"] = "expired", now
                     elif job["state"] == "claimed" and now - job["at"] > t2:
                         job["state"], job["at"] = "uncertain", now
                 turn = st["turn"]
-                if turn and turn["kind"] == "notif" and st["jobs"].get(turn.get("job") or "", {}).get("state") != "claimed":
-                    st["turn"] = None                         # its job is no longer claimed: the turn ends with it
-                st["completions"] = [c for c in st["completions"]
-                                     if st["jobs"].get(c["task"], {}).get("state") == "pending"]
+                if turn and turn["kind"] == "notif" and st["jobs"].get(turn.get("job") or "", {}).get("state") not in (
+                        "claimed", "delivered"):
+                    st["turn"] = None                         # its job is dead: the turn ends with it
                 for n in [n for n, r in st["nonces"].items() if r["state"] != "issued" and now - r["at"] > 2 * t2]:
                     del st["nonces"][n]
                 for tid in [k for k, j in st["jobs"].items()
@@ -807,7 +793,7 @@ class SharedSession:
 
     def close_turn(self) -> None:
         """Idle fallback: close a turn nobody ended (no Stop hook); a claimed job becomes uncertain."""
-        self.turn_end(text_sent=False)
+        self.turn_end()
 
 
 # ----------------------------------------------------------------------------- config

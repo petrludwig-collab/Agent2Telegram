@@ -374,20 +374,23 @@ delivers the result of a background task that a Telegram message started to THAT
 session stays fully usable over SSH/tmux. It needs `"mode": "attach"`, the `claude-code` agent,
 `"reply_to_origin_chat": true`, a `signal_file` and the Stop hook; a group counts only when it is listed
 in `"allowed_group_ids"`. The default is off, and when off nothing changes (no envelope, no state file).
-How it works: the bridge wraps the WHOLE prompt it types into one one-time envelope
-(`<a2t:N>...</a2t:N>`, N = 128 random bits) and stores N before typing it. The first `human` transcript
-record that is exactly that envelope makes the turn a Telegram turn; background tasks started inside
-that turn are bound to the chat; the completion (a `task-notification` record) is delivered once, only
-when nothing else is running and the chat is still authorised. Terminal input never joins a Telegram
-turn, never inherits its origin, and never changes the recipient of a task that is already bound; a
-completion that arrives while ANY turn runs never joins it: a Telegram or result turn is cut off for the
-rest of its length (one fixed line to its chat, nothing launched afterwards is bound) and a valid job stays deferred
-and is delivered afterwards, once, to its own chat (the agent is asked by a fixed prompt to report
-the finished task). The recipient is stored with the turn; an inbound message never changes it (another chat is
-queued behind the running turn, a result turn is never joined). In this mode one gate decides every send: a terminal turn forwards nothing, not even an explicit marker.
-If the state cannot be stored, the Telegram message is
-NOT typed into the session and the chat gets a fixed error; every injection is a single attempt; the terminal is never affected. Delivery is
-at-most-once: after a crash mid-delivery the task is marked `uncertain` and is not retried.
+How it works: Telegram and SSH/tmux are two entrances to ONE conversation; mixing them is fine and the bridge never
+waits. Every Telegram message is typed into the session at once, wrapped in a one-time envelope
+(`<a2t:N>...</a2t:N>`, N = 128 random bits, stored before typing, bound to the exact typed body). Claude orders its own
+queue; the transcript shows what it took: a `human` record, or, when it arrived during a running turn, an `attachment`
+of type `queued_command`. An exact envelope in either consumes the nonce; only a `human` record starts a new Telegram
+route, a queued one never starts a new answer. Background tasks launched inside a Telegram route are bound to its chat.
+When the harness itself starts processing a completion (a `task-notification` user record) of a bound, valid, still
+authorised job, that record starts a result route for the job's own chat (durable claim first) and the agent's answer
+goes there. `delivered` is set only when Telegram confirms the send of at least one result text; a route that ends
+without one (next turn boundary, Stop hook) leaves the job `uncertain`, which is never retried. A notification of an
+unbound, terminal, expired or foreign job starts no Telegram route. Terminal input never inherits a Telegram origin.
+The recipient belongs to the route: a message of another chat never takes over a running answer. If such a message is
+queued INSIDE a running answer, Claude will very likely answer both in the same turn, so forwarding of that answer
+stops and both chats get one fixed line (a documented decision point; no option keeps both chats correct and fully
+delivered without the bridge waiting). In this mode one gate decides every send: a terminal turn forwards nothing, not
+even an explicit marker. If the state cannot be stored, the Telegram message is NOT typed into the session and the chat
+gets a fixed error; every injection is a single attempt; the terminal is never affected.
 `"shared_session_nonce_ttl"` (seconds, default 600) limits the time from typing a prompt to its
 appearance in the transcript; `"shared_session_job_ttl"` (default 86400) limits how long a bound task
 stays deliverable. State lives in one file next to the signal file (`shared_session_<tmux>.json`).

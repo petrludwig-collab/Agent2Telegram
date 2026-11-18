@@ -6,7 +6,7 @@ import unittest
 
 from agent2telegram import shared_session as shared
 
-from n1_rig import GROUP, OWNER, RigTestCase
+from n1_rig import OWNER, RigTestCase
 
 SENTINEL = "LOCAL_ONLY sentinel text"
 
@@ -159,125 +159,6 @@ class EnvelopeBodyTests(RigTestCase):
             r.submit(shared.wrap_prompt(nonce, "tampered " + private_body))
         self.assertNotIn(private_body, " ".join(logs.output))
 
-    def test_report_prompts_are_bound_to_their_body_too(self):
-        r = self.rig
-        r.tg_turn(OWNER)
-        r.launch("t1")
-        r.end_turn()
-        r.terminal("busy")
-        r.notify("t1")
-        r.end_turn()
-        nonce, inner = shared.parse_envelope(r.typed[-1])
-        r.submit(shared.wrap_prompt(nonce, inner + " plus extra"))
-        self.assertNotEqual(r.n1.turn()["kind"], "notif")
-        self.assertEqual(r.job("t1"), "uncertain")
-
-
-class StaleReportWorkerTests(RigTestCase):
-    def reserve(self):
-        """A report claim reserved by the tick, its worker NOT started yet (the barrier)."""
-        r = self.rig
-        r.tg_turn(OWNER)
-        r.launch("t1")
-        r.end_turn()
-        r.terminal("busy")
-        r.notify("t1")
-        started = []
-        r.bridge._n1_run = lambda fn: started.append(fn)
-        r.stop()
-        r.tick()
-        self.assertEqual(len(started), 1)
-        return started[0]
-
-    def test_a_worker_delayed_past_expiry_and_the_next_turn_neither_injects_nor_disturbs_it(self):
-        r = self.rig
-        clock = type("C", (), {"t": 1_000_000.0, "__call__": lambda s: s.t})()
-        r.n1._clock = clock
-        worker = self.reserve()
-        clock.t += 601
-        r.tick()                                                       # T1 passed: released, job uncertain
-        self.assertEqual(r.job("t1"), "uncertain")
-        self.assertEqual(r.bridge._route.kind, "none")
-        r.bridge._n1_run = lambda fn: fn()
-        r.tg_turn(GROUP, "a new turn of another chat")                 # the next turn starts
-        typed = len(r.typed)
-        route = (r.bridge._route.kind, r.bridge._route.chat)
-        began = []
-        real_begin = r.bridge._begin_turn
-        r.bridge._begin_turn = lambda: (began.append(1), real_begin())[1]
-        worker()                                                       # the stale worker finally runs
-        self.assertEqual(len(r.typed), typed, "no injection with the stale nonce")
-        self.assertEqual(began, [], "it must not even touch the new turn's bookkeeping")
-        self.assertEqual((r.bridge._route.kind, r.bridge._route.chat), route)
-        self.assertTrue(r.bridge._turn_from_tg)
-        self.assertEqual(r.job("t1"), "uncertain")
-
-    def paused_write(self, clock):
-        """Start the worker in a thread and pause it AFTER its validity check, AT the tmux write."""
-        import threading
-        r = self.rig
-        worker = self.reserve()
-        at_write, resume = threading.Event(), threading.Event()
-        real = r.bridge._session.inject
-
-        def slow_inject(*a, **k):
-            at_write.set()
-            resume.wait(10)
-            return real(*a, **k)
-        r.bridge._session.inject = slow_inject
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
-        self.assertTrue(at_write.wait(5))
-        return t, resume
-
-    def test_expiry_and_a_new_turn_cannot_slip_between_the_check_and_the_tmux_write(self):
-        import threading
-        r = self.rig
-        clock = type("C", (), {"t": 1_000_000.0, "__call__": lambda s: s.t})()
-        r.n1._clock = clock
-        t, resume = self.paused_write(clock)
-        clock.t += 601                                                 # the claim expires while the write is pending
-        r.bridge._n1_run = lambda fn: fn()
-        tick_done = threading.Event()
-        threading.Thread(target=lambda: (r.tick(), tick_done.set()), daemon=True).start()
-        self.assertFalse(tick_done.wait(0.4), "expiry/release must wait for the single write (check + write are atomic)")
-        self.assertEqual(r.bridge._route.kind, "pending", "the route is not released under the writer's feet")
-        self.assertEqual(r.n1.nonce_state(r.bridge._route.nonce), "issued", "the claim is not expired under it either")
-        resume.set()
-        t.join(5)
-        self.assertTrue(tick_done.wait(5), "nothing deadlocks once the slow write completed")
-        typed_for_report = [x for x in r.typed if "t1" in x]
-        self.assertEqual(len(typed_for_report), 1)
-        self.assertEqual(r.job("t1"), "uncertain")                     # then T1 releases it, never retried
-        self.assertEqual(r.bridge._route.kind, "none")
-        typed = len(r.typed)
-        r.tg_turn(GROUP, "the next turn")                              # a new turn proceeds normally
-        self.assertEqual(len(r.typed), typed + 1)
-        self.assertEqual(r.n1.turn()["chat"], GROUP)
-
-    def test_inbound_proceeds_after_a_slow_write_completed(self):
-        import threading
-        r = self.rig
-        t, resume = self.paused_write(None)
-        done = threading.Event()
-        typed_before = len(r.typed)
-        threading.Thread(target=lambda: (r.tg(OWNER, "inbound while the report is being typed"), done.set()),
-                         daemon=True).start()
-        self.assertFalse(done.wait(0.3), "inbound waits behind the pending report turn")
-        resume.set()
-        t.join(5)
-        r.submit(r.typed[typed_before])                                # the report envelope is consumed ...
-        r.say("[tg] result")
-        r.end_turn()                                                   # ... and its turn ends
-        self.assertTrue(done.wait(5), "the queued inbound message is processed afterwards")
-
-    def test_a_worker_whose_claim_is_still_valid_injects_exactly_once(self):
-        r = self.rig
-        worker = self.reserve()
-        typed = len(r.typed)
-        worker()
-        self.assertEqual(len(r.typed), typed + 1)
-        self.assertEqual(r.bridge._route.kind, "pending")
 
 
 if __name__ == "__main__":
