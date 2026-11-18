@@ -149,15 +149,15 @@ class EnvelopeBodyTests(RigTestCase):
 
     def test_the_fingerprint_is_not_the_content_and_logs_carry_no_raw_text(self):
         r = self.rig
-        secret = "my private prompt body"
-        typed = self.issue(secret)
+        private_body = "my private prompt body"
+        typed = self.issue(private_body)
         nonce = shared.parse_envelope(typed)[0]
         stored = r.n1.snapshot()["nonces"][nonce]
-        self.assertNotIn(secret, json.dumps(r.n1.snapshot()))
+        self.assertNotIn(private_body, json.dumps(r.n1.snapshot()))
         self.assertRegex(stored["fp"], "^[0-9a-f]{64}$")
         with self.assertLogs("agent2telegram.shared_session", level="WARNING") as logs:
-            r.submit(shared.wrap_prompt(nonce, "tampered " + secret))
-        self.assertNotIn(secret, " ".join(logs.output))
+            r.submit(shared.wrap_prompt(nonce, "tampered " + private_body))
+        self.assertNotIn(private_body, " ".join(logs.output))
 
     def test_report_prompts_are_bound_to_their_body_too(self):
         r = self.rig
