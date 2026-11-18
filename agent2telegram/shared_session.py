@@ -103,6 +103,16 @@ def wrap_prompt(nonce: str, text: str) -> str:
     return f"{_L}a2t:{nonce}{_R}{body}{_L}/a2t:{nonce}{_R}"
 
 
+def fingerprint(body: str) -> str:
+    """sha256 of the envelope body as it is typed (the guillemets are neutralised exactly like wrap_prompt).
+    Only this hash is stored or logged, never the content."""
+    return hashlib.sha256(body.replace(_L, "<").replace(_R, ">").encode("utf-8")).hexdigest()
+
+
+#: An unreadable complete transcript line stands for a lost record (possibly a switch to the terminal).
+UNREADABLE_RECORD = {"type": "user", "uuid": None, "message": {"role": "user", "content": ""}}
+
+
 def parse_envelope(text: str):
     """``(nonce, inner)`` when the whole normalised text is exactly one envelope, else None."""
     m = _ENVELOPE.match(normalise(text))
@@ -467,13 +477,13 @@ class SharedSession:
         adopt(st)
 
     # ---- issuing (R8) ------------------------------------------------------
-    def issue(self, chat: int) -> str:
+    def issue(self, chat: int, fp: str) -> str:
         """Store a new one-time nonce for ``chat`` BEFORE the prompt is typed. Raises StateError when it
         cannot be stored safely; the caller must then not inject."""
         with self._lock:
-            return self._issue_locked(chat, "inbound", None)
+            return self._issue_locked(chat, "inbound", None, fp)
 
-    def _issue_locked(self, chat, purpose, job) -> str:
+    def _issue_locked(self, chat, purpose, job, fp) -> str:
         if self.degraded is not None or self._s is None or self._s["transcript"] is None:
             raise StateError("state not usable")
         if type(chat) is not int:
@@ -484,7 +494,7 @@ class SharedSession:
         def f(st):
             st["nonces"][nonce] = {"chat": chat, "state": "issued", "purpose": purpose, "job": job,
                                    "session": st["transcript"]["session"], "at": now, "off": None,
-                                   "replays": 0}
+                                   "replays": 0, "fp": fp}
         self._commit(f)
         return nonce
 
@@ -593,7 +603,14 @@ class SharedSession:
             nonce = parsed[0]
             nrec = st["nonces"].get(nonce)
             if nrec and nrec["state"] == "issued":
-                if now - nrec["at"] <= self.nonce_ttl and nrec["session"] == st["transcript"]["session"]:
+                if nrec.get("fp") != fingerprint(parsed[1]):
+                    # right tags, other body: not the prompt that was typed (edited, mixed, shortened)
+                    nrec["state"], nrec["at"] = "revoked", now
+                    mjob = st["jobs"].get(nrec.get("job") or "")
+                    if nrec["purpose"] == "report" and mjob and mjob["state"] == "claimed":
+                        mjob["state"], mjob["at"] = "uncertain", now
+                    log.warning("shared session: envelope body differs from the typed prompt -> not Telegram")
+                elif now - nrec["at"] <= self.nonce_ttl and nrec["session"] == st["transcript"]["session"]:
                     consumed = nonce
                 else:
                     nrec["state"], nrec["at"] = "expired", now
@@ -709,7 +726,7 @@ class SharedSession:
             except StateError:
                 pass
 
-    def claim_deferred(self) -> dict | None:
+    def claim_deferred(self, fingerprint_of=None) -> dict | None:
         """The oldest deferred completion that is still valid, claimed in ONE write together with the
         one-time envelope of its report prompt. None when nothing may be claimed now."""
         with self._lock:
@@ -736,7 +753,8 @@ class SharedSession:
                     nonce = new_nonce()
                     st["nonces"][nonce] = {"chat": job["chat"], "state": "issued", "purpose": "report",
                                            "job": c["task"], "session": st["transcript"]["session"],
-                                           "at": now, "off": None, "replays": 0}
+                                           "at": now, "off": None, "replays": 0,
+                                           "fp": fingerprint_of(c["task"]) if fingerprint_of else None}
                     job["state"], job["at"] = "claimed", now
                     result.update(task=c["task"], chat=job["chat"], nonce=nonce)
                 st["completions"] = keep

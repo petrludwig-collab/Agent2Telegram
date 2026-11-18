@@ -1659,7 +1659,8 @@ class AttachBridge:
             inbound_chat = chat if chat is not None else self._owner_chat
             try:
                 # The chat of THIS message, passed in: the shared _owner_chat may have moved meanwhile.
-                nonce = self._n1.issue(inbound_chat)         # stored BEFORE anything is typed (R8)
+                # stored BEFORE anything is typed (R8), bound to the exact body that will be typed
+                nonce = self._n1.issue(inbound_chat, shared.fingerprint(self._session.compose(text)))
             except shared.StateError:
                 return self._n1_refuse(inbound_chat)
         extra = {"nonce": nonce} if nonce else {}
@@ -1910,7 +1911,8 @@ class AttachBridge:
         claim = None
         with self._n1_gate:
             if not self._n1_busy():
-                claim = n1.claim_deferred()
+                claim = n1.claim_deferred(
+                    lambda task: shared.fingerprint(self._session.compose(shared.REPORT_PROMPT.format(task=task))))
                 if claim:                      # reserve the bridge before the gate is released
                     self._n1_enter("pending", claim["chat"], job=claim["task"], nonce=claim["nonce"])
         if claim:
@@ -1925,8 +1927,13 @@ class AttachBridge:
         agent to report the finished task. Its own thread (a tmux write can take seconds). No notice is
         sent to the stored chat on failure: it is not a current inbound context (R7)."""
         ok = False
-        try:
+        with self._n1_gate:
+            r = self._route
+            if r.kind != "pending" or r.nonce != claim["nonce"] or self._n1.nonce_state(claim["nonce"]) != "issued":
+                log.warning("shared session: stale report worker dropped (claim no longer valid)")
+                return                              # released/expired meanwhile: touch nothing of a newer turn
             self._begin_turn()
+        try:
             ok = self._inject(shared.REPORT_PROMPT.format(task=claim["task"]),
                               nonce=claim["nonce"], notify=False)
         except Exception as e:
@@ -2643,10 +2650,19 @@ class AttachBridge:
                 try:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
-                    continue
+                    rec = None
+                    if n1 is None:
+                        continue
                 if n1 is not None:
+                    if not isinstance(rec, dict):
+                        # A complete line that cannot be read stands for a lost record (maybe a switch to
+                        # the terminal): the origin is no longer known, so it closes the Telegram window.
+                        log.warning("shared session: unreadable transcript line -> origin closed")
+                        rec = shared.UNREADABLE_RECORD
                     with self._n1_gate:
                         self._n1_apply(n1.on_record(rec_off, off, rec))
+                    if rec is shared.UNREADABLE_RECORD:
+                        continue
                 self._rec_live = self._record_is_live(rec_off, rec)
                 # Prompt identity is independent of reader delivery dedup: the user can
                 # legitimately repeat the same question in a later turn.

@@ -309,6 +309,15 @@ class TmuxSession:
     def _pane_ok(self) -> tuple[bool, str]:
         return _agent_alive(self.name, getattr(self, "_expected_agent_commands", ()))
 
+    def compose(self, text: str) -> str:
+        """The exact string that is typed for ``text`` (sanitised, one line, origin prefix). The shared
+        session binds its envelope to this string, so the producer and the verifier use the same function."""
+        text = sanitize_for_tmux(text)
+        text = " ".join(text.splitlines())                 # one Enter submits everything
+        if self._origin:
+            text = f"{self._origin}{text}"
+        return sanitize_for_tmux(text)
+
     def _send_keys(self, text: str, nonce: str | None = None) -> None:
         ok, detail = self._pane_ok()
         if not ok:
@@ -316,11 +325,7 @@ class TmuxSession:
             # Telegram message as a shell command instead of submitting it to the agent TUI.
             log.warning("refusing tmux injection into '%s': %s", self.name, detail)
             raise SessionError(f"refusing to inject into tmux session '{self.name}': {detail}")
-        text = sanitize_for_tmux(text)
-        text = " ".join(text.splitlines())                 # one Enter submits everything
-        if self._origin:
-            text = f"{self._origin}{text}"
-        text = sanitize_for_tmux(text)
+        text = self.compose(text)
         if nonce:
             # Shared-session correlation: the envelope wraps the WHOLE prompt, origin prefix included,
             # and is added after the length cap so it can never be cut in half.
