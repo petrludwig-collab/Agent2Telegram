@@ -991,16 +991,23 @@ class AttachBridge:
         if outbox is not None:
             chunks = split_message(text) if text else []
             files = list(getattr(self, "_pending_files", []) or [])
+            job = self._n1_job_now()
+            if job and (chunks or files):
+                # The INTENT is persisted first (outbox key -> job/chat), then the reply is stored: a crash between the
+                # two cannot lose the binding. delivered only when Telegram confirms (one atomic write).
+                key = key or f"n1-{shared.new_nonce()}"
+                if not self._n1.bind_send(key, job, target):
+                    self._n1_dropped("result reply (intent not stored)")
+                    self._pending_files = []
+                    return
             try:
-                record_id = outbox.enqueue(chunks, files, key, chat=target)
+                outbox.enqueue(chunks, files, key, chat=target)
             except Exception as e:
+                if job:
+                    self._n1.abort_send(key)
                 log.error("could not persist the outgoing reply, falling back to the old path: %s", e)
             else:
-                job = self._n1_job_now()
-                if job and (chunks or files):
-                    # persisted in the atomic state: a confirmation after a restart or after the route ended still
-                    # marks the job delivered (delivered only when Telegram confirms)
-                    self._n1.bind_send(record_id, job, target)
+
                 self._pending_files = []
                 if turn_text:
                     # For the backstop the reply is handled once it is durably stored.
@@ -1077,17 +1084,14 @@ class AttachBridge:
             # private reply into a group once a group message arrived in between (audit
             # 2026-10-10). Legacy records without a stored chat keep the old behaviour.
             chat = rec.chat if rec.chat is not None else self._legacy_chat()
-            if self._n1 is not None and not self._n1_chat_authorised(chat):
-                # Authorisation is checked at the moment of the send: a revoked chat gets nothing, and a result
-                # that was bound to a job is uncertain (never resent by us).
-                bound = self._n1.pop_send(rec.record_id)
-                if bound:
-                    self._n1.mark_uncertain(bound[0])
-                outbox.give_up(rec.record_id, "chat no longer authorised")
-                log.warning("shared session: stored reply not sent, chat no longer authorised")
+            if self._n1_revoked_drop(outbox, rec, chat):
                 continue
             # Parts already confirmed by Telegram are NOT resent — only the remaining ones.
+            revoked = False
             for index, chunk in rec.pending_chunks:
+                if self._n1_revoked(chat):                  # re-checked for EVERY part
+                    revoked = True
+                    break
                 try:
                     self.tg.send_message(chat, chunk)
                 except Exception as e:
@@ -1095,9 +1099,15 @@ class AttachBridge:
                                 index, type(e).__name__, message_metadata(chunk))
                     return
                 outbox.mark_chunk_sent(rec.record_id, index)
-                self._n1_confirm_record(rec.record_id)
+                self._n1_confirm_record(rec, chat)
+            if revoked:
+                self._n1_revoked_drop(outbox, rec, chat, force=True)
+                continue
             gave_up = False
             for file_path in rec.pending_files:
+                if self._n1_revoked(chat):                  # and for EVERY file
+                    revoked = True
+                    break
                 try:
                     self._send_one_file(file_path, chat)
                 except Exception as e:
@@ -1122,7 +1132,10 @@ class AttachBridge:
                         break
                     return
                 outbox.mark_file_sent(rec.record_id, file_path)
-                self._n1_confirm_record(rec.record_id)
+                self._n1_confirm_record(rec, chat)
+            if revoked:
+                self._n1_revoked_drop(outbox, rec, chat, force=True)
+                continue
             if gave_up:
                 continue          # the record is in dead-letter, the queue moves on
             if rec.key and not self._mark_sent(rec.key):
@@ -1761,6 +1774,9 @@ class AttachBridge:
         repeat the notice. Never reports success."""
         self._n1_release_if_idle()
         log.error("shared session: prompt NOT injected, correlation state unavailable")
+        if chat is not None and self._n1_revoked(chat):
+            log.warning("shared session: refusal notice not sent: chat not authorised")
+            return True
         if chat is not None:
             try:
                 self.tg.send_message(chat, shared.REFUSED_TEXT)
@@ -1812,6 +1828,20 @@ class AttachBridge:
             return False
         return True
 
+    def _n1_revoked(self, chat) -> bool:
+        return self._n1 is not None and not self._n1_chat_authorised(chat)
+
+    def _n1_revoked_drop(self, outbox, rec, chat, force=False) -> bool:
+        """Authorisation is checked at the moment of the send: a revoked chat gets nothing more, the rest of the stored
+        reply goes to dead-letter (never sent later), and a still claimed result job is uncertain."""
+        if not (force or self._n1_revoked(chat)):
+            return False
+        if rec.key:
+            self._n1.abort_send(rec.key)
+        outbox.give_up(rec.record_id, "chat no longer authorised")
+        log.warning("shared session: stored reply not sent, chat no longer authorised")
+        return True
+
     def _n1_dropped(self, what: str) -> None:
         log.info("shared session: %s not forwarded (route=%s cut=%s)", what, self._route.kind, self._route.cut)
 
@@ -1841,11 +1871,11 @@ class AttachBridge:
         if job and self._n1 is not None:
             self._n1.confirm_delivered(job, chat)
 
-    def _n1_confirm_record(self, record_id) -> None:
-        """A part of a stored reply was CONFIRMED by Telegram: only now is a result job delivered."""
-        sent = self._n1.pop_send(record_id) if self._n1 is not None else None
-        if sent:
-            self._n1_confirm(*sent)
+    def _n1_confirm_record(self, rec, chat) -> None:
+        """A part of a stored reply was CONFIRMED by Telegram: only now is a result job delivered (binding removal
+        and the job state change in one state write)."""
+        if self._n1 is not None and rec.key:
+            self._n1.confirm_key(rec.key, chat)
 
     def _n1_apply(self, out) -> None:
         """Apply SharedSession's verdict on one transcript record. Called under ``_n1_gate``."""
@@ -1875,6 +1905,9 @@ class AttachBridge:
     def _n1_service_line(self, chat, text) -> None:
         """One fixed line to a chat whose answer was stopped. Best effort: a failure is logged explicitly (the
         forwarding stays stopped either way) and never reported as success."""
+        if chat is not None and self._n1_revoked(chat):
+            log.warning("shared session: service line to chat %s NOT delivered: chat not authorised", chat)
+            return
         if chat is not None:
             try:
                 self.tg.send_message(chat, text)
@@ -1898,6 +1931,17 @@ class AttachBridge:
         turn = self._n1.turn()
         if turn and turn["kind"] == "tg":
             self._n1_enter("tg", turn["chat"], nonce=turn.get("nonce"), cut=bool(turn.get("cut")))
+        outbox = self._ensure_outbox()
+        if outbox is not None:
+            stored = {r.key: r for r in outbox.pending() if r.key}
+
+            def state_of(key):
+                rec = stored.get(key)
+                if rec is not None:
+                    part_sent = (len(rec.pending_chunks) < len(rec.chunks)) or (len(rec.pending_files) < len(rec.files))
+                    return "delivered" if part_sent else "pending"
+                return "delivered" if key in self._sent_keys else "orphan"
+            self._n1.reconcile(state_of)
 
     def _n1_turn_ended(self) -> None:
         with self._n1_gate:
@@ -2715,6 +2759,9 @@ class AttachBridge:
             self._n1_dropped("files")
             return
         for raw in paths:
+            if getattr(self, "_n1", None) is not None and not self._n1_forward_ok():
+                self._n1_dropped("files")                   # authorisation is re-checked for EVERY file
+                return
             resolved, reason = self._safe_outbox_path(raw)
             if resolved is None:
                 log.warning("refusing to send %s: %s",

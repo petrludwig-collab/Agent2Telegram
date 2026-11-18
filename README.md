@@ -379,8 +379,8 @@ waits. Every Telegram message is typed into the session at once, wrapped in a on
 (`<a2t:N>...</a2t:N>`, N = 128 random bits, stored before typing, bound to the exact typed body). Claude orders its own
 queue; the transcript shows what it took: a `human` record, or, when it arrived during a running turn, an `attachment`
 of type `queued_command`. One envelope with a matching body in either consumes the nonce (other text around it is terminal typing: mixing is allowed;
-two envelopes or a changed body are not Telegram input), and a second appearance of the same input (queued first, the
-`human` record when Claude runs it) is the same input, not a replay. A bridge tag that cannot be validated while a route is
+two envelopes or a changed body are not Telegram input), and a second appearance of the same input is accepted only as the
+queued -> `human` transition (same session, same body, within the long bound, before any transcript reset), any other repeat is a replay. A bridge tag that cannot be validated while a route is
 running stops that route, like input of another chat; only a `human` record starts a new Telegram
 route, a queued one never starts a new answer. Background tasks launched inside a Telegram route are bound to its chat.
 When the harness itself starts processing a completion (a `task-notification` user record) of a bound, valid, still

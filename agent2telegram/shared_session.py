@@ -503,6 +503,8 @@ class SharedSession:
         for rec in st["nonces"].values():
             if rec["state"] == "issued":
                 rec["state"], rec["at"] = "revoked", now
+            elif rec["state"] == "consumed":
+                rec["closed"] = True                          # no second appearance after a transcript reset
         for job in st["jobs"].values():
             if job["state"] == "pending":
                 job["state"], job["at"] = "revoked", now
@@ -558,31 +560,75 @@ class SharedSession:
             except StateError:
                 pass
 
-    def bind_send(self, record_id: str, job: str, chat: int) -> None:
-        """Persist which stored outbox reply is a result of which job (survives a restart and the end of the route)."""
+    def bind_send(self, key: str, job: str, chat: int) -> bool:
+        """Persist the INTENT to send a result reply of ``job`` to ``chat`` under the outbox key ``key``. Written BEFORE
+        the reply is stored in the outbox, so a crash between the two cannot lose it. False = not stored: do not send."""
         with self._lock:
             if self._s is None or self.degraded is not None:
-                return
+                return False
             now = self._clock()
             try:
                 self._commit(lambda st: st["sends"].update(
-                    {record_id: {"job": job, "chat": chat, "session": st["transcript"]["session"], "at": now}}))
+                    {key: {"job": job, "chat": chat, "session": st["transcript"]["session"], "at": now}}))
+            except StateError:
+                return False
+            return True
+
+    def confirm_key(self, key: str, chat: int) -> None:
+        """Telegram CONFIRMED a part of the stored reply ``key``: the binding is removed and the job is marked delivered
+        in ONE state write (a crash cannot leave one without the other)."""
+        with self._lock:
+            if self._s is None or self.degraded is not None or key not in self._s["sends"]:
+                return
+
+            def f(st):
+                bound = st["sends"].pop(key)
+                job = st["jobs"].get(bound["job"])
+                if job and job["chat"] == bound["chat"] == chat and job["state"] in ("claimed", "uncertain"):
+                    job["state"], job["at"] = "delivered", self._clock()
+            try:
+                self._commit(f)
             except StateError:
                 pass
 
-    def pop_send(self, record_id: str):
-        """The (job, chat) a stored reply was bound to, removed from the state; None when it was not a result."""
+    def abort_send(self, key: str) -> None:
+        """The stored reply ``key`` must not be sent (authorisation gone, enqueue failed): binding removed and a claimed
+        job becomes uncertain, in one write. Never resent by us."""
         with self._lock:
-            if self._s is None or self.degraded is not None:
-                return None
-            bound = self._s["sends"].get(record_id)
-            if not bound:
-                return None
+            if self._s is None or self.degraded is not None or key not in self._s["sends"]:
+                return
+
+            def f(st):
+                bound = st["sends"].pop(key)
+                job = st["jobs"].get(bound["job"])
+                if job and job["state"] == "claimed":
+                    job["state"], job["at"] = "uncertain", self._clock()
             try:
-                self._commit(lambda st: st["sends"].pop(record_id, None))
+                self._commit(f)
             except StateError:
-                return None
-            return bound["job"], bound["chat"]
+                pass
+
+    def reconcile(self, state_of) -> None:
+        """After a restart: resolve every stored intent against the outbox. ``state_of(key)`` is "delivered" (a part was
+        confirmed or the key is in the delivered ledger), "pending" (still stored, may be confirmed later) or "orphan"
+        (no stored reply: the intent is dropped, the job stays uncertain)."""
+        with self._lock:
+            if self._s is None or self.degraded is not None or not self._s["sends"]:
+                return
+            verdict = {key: state_of(key) for key in self._s["sends"]}
+
+            def f(st):
+                for key, v in verdict.items():
+                    if v == "pending" or key not in st["sends"]:
+                        continue
+                    bound = st["sends"].pop(key)
+                    job = st["jobs"].get(bound["job"])
+                    if v == "delivered" and job and job["chat"] == bound["chat"] and job["state"] in ("claimed", "uncertain"):
+                        job["state"], job["at"] = "delivered", self._clock()
+            try:
+                self._commit(f)
+            except StateError:
+                pass
 
     def mark_uncertain(self, task: str) -> None:
         """A claimed result that must not be sent any more (authorisation gone) is uncertain, never resent by us."""
@@ -676,7 +722,7 @@ class SharedSession:
             if job and job["state"] == "claimed":
                 job["state"], job["at"] = "uncertain", now
 
-    def _consume(self, st, offset, text, now, out):
+    def _consume(self, st, offset, text, now, out, kind):
         """The consumption checks for an envelope in an input record (human or queued). Returns the consumed nonce or
         None. Exactly ONE envelope with a matching body may sit among other text (terminal typing: mixing is allowed);
         two envelopes, a changed body, an unknown/revoked/expired nonce or a replay are not Telegram input.
@@ -699,7 +745,7 @@ class SharedSession:
                 log.warning("shared session: envelope body differs from the typed prompt -> not Telegram")
             elif now - nrec["at"] <= self.job_ttl and nrec["session"] == st["transcript"]["session"]:
                 # Bound by the session and the long orphan bound T2, NOT by T1: an input may wait in Claude's queue.
-                nrec["appearances"], nrec["offs"] = 1, [offset]
+                nrec["appearances"], nrec["offs"], nrec["first_kind"] = 1, [offset], kind
                 return nonce
             else:
                 nrec["state"], nrec["at"] = "expired", now
@@ -707,8 +753,11 @@ class SharedSession:
             if offset in nrec.get("offs", [nrec.get("off")]):
                 out.noop = True                           # this very record, re-read after a restart
                 return None
-            if nrec.get("fp") == fingerprint(inner) and nrec.get("appearances", 1) == 1:
-                # the SAME input once more (queued_command first, the human record when Claude runs it, or the reverse)
+            if (nrec.get("fp") == fingerprint(inner) and nrec.get("appearances", 1) == 1
+                    and nrec.get("first_kind") == "queued" and kind == "human" and not nrec.get("closed")
+                    and nrec["session"] == st["transcript"]["session"] and now - nrec["at"] <= self.job_ttl):
+                # the SAME input once more, ONLY as the queued_command -> human transition (Claude runs what it queued),
+                # same session, same body, within T2 and before any transcript reset; anything else is a replay
                 nrec["appearances"] = 2
                 nrec["offs"] = list(nrec.get("offs", [])) + [offset]
                 out.again = True
@@ -723,7 +772,7 @@ class SharedSession:
         terminal (no route)."""
         now = self._clock()
         text = record_text(rec) if kind == "human" else ""
-        consumed = self._consume(st, offset, text, now, out) if kind == "human" else None
+        consumed = self._consume(st, offset, text, now, out, "human") if kind == "human" else None
         if out.noop:
             return
         self._end_route(st, now)
@@ -742,7 +791,7 @@ class SharedSession:
         route never takes the route over. A tag that cannot be validated (expired, revoked, unknown, replayed, two
         envelopes, changed body) is input Claude has seen that we cannot attribute: an active route is cut as well."""
         now = self._clock()
-        consumed = self._consume(st, offset, record_text(rec), now, out)
+        consumed = self._consume(st, offset, record_text(rec), now, out, "queued")
         if out.noop:
             return
         turn = st["turn"]

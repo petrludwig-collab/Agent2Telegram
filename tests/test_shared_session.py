@@ -474,10 +474,7 @@ class ReplayAndMixedTests(RigTestCase):
         r.submit()
         r.launch("t1")
         r.end_turn()
-        r.submit(env)                                                  # the same input once more: idempotent
-        self.assertEqual(r.n1.turn()["kind"], "tg")
-        r.end_turn()
-        r.submit(env)                                                  # a THIRD appearance is a genuine replay
+        r.submit(env)                                                  # human then human: NOT the queued->human case
         nonce = shared.parse_envelope(env)[0]
         self.assertEqual(r.n1.snapshot()["nonces"][nonce]["replays"], 1)
         self.assertEqual(r.n1.turn()["kind"], "other")

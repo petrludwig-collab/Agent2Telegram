@@ -12,14 +12,16 @@ Historic RED (5db88bb): a report prompt recorded as queued_command was never con
 result was dropped and the job became uncertain after T1 (see the A4 characterisation commits 9ef9b2c / 5db88bb).
 """
 import json
+import os
 import threading
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from agent2telegram import attach as attach_mod
 from agent2telegram import shared_session as shared
 
-from n1_rig import GROUP, OWNER, RigTestCase
+from n1_rig import GROUP, OWNER, RigTestCase, human
 
 RESULT = "RESULT-A4 synthetic result text"
 
@@ -293,16 +295,11 @@ class QueuedEnvelopeChecksTests(DirectCase):
         changed = shared.wrap_prompt(nonce, inner + " tampered")
         r.tg(GROUP, "two")
         two = r.typed[-1] * 2
-        for label, prompt in {"replayed twice": None, "revoked": revoked, "changed body": changed,
+        for label, prompt in {"human then queued": replay_prompt, "revoked": revoked, "changed body": changed,
                               "two envelopes": two}.items():
             with self.subTest(label):
                 r.tg_turn(OWNER, "a new route of chat A")
-                if prompt is None:
-                    self.queue(replay_prompt)                          # second appearance: idempotent
-                    self.assertFalse(r.bridge._route.cut)
-                    self.queue(replay_prompt)                          # third: a genuine replay
-                else:
-                    self.queue(prompt)
+                self.queue(prompt)
                 self.assertTrue(r.bridge._route.cut, label)
                 r.end_turn()
 
@@ -328,7 +325,7 @@ class QueuedEnvelopeChecksTests(DirectCase):
         r.tick()
         self.assertEqual(r.sent_to(OWNER), ["common answer"])
 
-    def test_queued_then_human_appearance_of_the_same_input_is_idempotent_both_orders(self):
+    def test_queued_then_human_appearance_of_the_same_input_is_idempotent_only_in_that_order(self):
         r = self.rig
         r.tg_turn(OWNER, "route A")
         self.assertTrue(r.tg(GROUP, "chat B"))
@@ -338,23 +335,60 @@ class QueuedEnvelopeChecksTests(DirectCase):
         self.assertTrue(r.bridge._route.cut)
         r.submit(prompt_b)                                             # then Claude runs it: a human record
         self.assertEqual(r.n1.snapshot()["nonces"][nonce_b]["replays"], 0, "same input, not a replay")
-        self.assertEqual(r.bridge._route.kind, "tg")
-        self.assertEqual(r.bridge._route.chat, GROUP, "B's own turn starts when Claude really runs its input")
+        self.assertEqual((r.bridge._route.kind, r.bridge._route.chat), ("tg", GROUP))
         r.say("[tg] B's own answer")
         r.end_turn()                                                   # a group's final answer is sent at the turn end
         self.assertEqual(r.sent_to(GROUP).count("B's own answer"), 1)
         self.assertEqual(r.sent_to(GROUP).count(shared.ROUTE_SWITCH_QUEUED), 1, "the line is not repeated")
-        self.queue(prompt_b)                                           # a THIRD appearance is a genuine replay
+        r.submit(prompt_b)                                             # a third appearance is a genuine replay
         self.assertEqual(r.n1.snapshot()["nonces"][nonce_b]["replays"], 1)
-        # reverse order: a human record first, the queued evidence afterwards
-        r.tg(OWNER, "second input")
-        prompt_2 = r.typed[-1]
-        nonce_2 = shared.parse_envelope(prompt_2)[0]
-        r.submit(prompt_2)
-        self.queue(prompt_2)
-        self.assertEqual(r.n1.snapshot()["nonces"][nonce_2]["replays"], 0)
-        self.queue(prompt_2)
-        self.assertEqual(r.n1.snapshot()["nonces"][nonce_2]["replays"], 1)
+
+    def second_appearance_refusals(self, label):
+        r = self.rig
+        r.tg(OWNER, "queued input")
+        prompt = r.typed[-1]
+        nonce = shared.parse_envelope(prompt)[0]
+        r.tg_turn(OWNER, "a running route")
+        self.queue(prompt)                                             # consumed via queued_command
+        self.assertEqual(r.n1.nonce_state(nonce), "consumed")
+        return r, prompt, nonce
+
+    def test_the_second_appearance_is_refused_after_a_transcript_reset(self):
+        r, prompt, nonce = self.second_appearance_refusals("reset")
+        replacement = r.tmp / "new.jsonl"
+        replacement.write_text(json.dumps(human("another session", "z0")) + "\n")
+        os.replace(replacement, r.transcript)
+        r.drain()
+        r.submit(prompt)                                               # the human record of the OLD input
+        self.assertEqual(r.n1.snapshot()["nonces"][nonce]["replays"], 1)
+        self.assertEqual(r.n1.turn()["kind"], "other")
+        self.assertEqual(r.client.sent, [])
+
+    def test_the_second_appearance_is_refused_after_t2(self):
+        r, prompt, nonce = self.second_appearance_refusals("t2")
+        clock = Clock()
+        clock.t = r.n1._clock() + 86401
+        r.n1._clock = clock
+        r.submit(prompt)
+        self.assertEqual(r.n1.snapshot()["nonces"][nonce]["replays"], 1)
+        self.assertEqual(r.n1.turn()["kind"], "other")
+
+    def test_the_second_appearance_is_refused_for_another_session(self):
+        r, prompt, nonce = self.second_appearance_refusals("session")
+        r.n1._commit(lambda st: st["nonces"][nonce].update(session="another-session"))
+        r.submit(prompt)
+        self.assertEqual(r.n1.snapshot()["nonces"][nonce]["replays"], 1)
+
+    def test_the_second_appearance_is_refused_when_the_kinds_do_not_differ(self):
+        r, prompt, nonce = self.second_appearance_refusals("kind")
+        self.queue(prompt)                                             # queued then queued
+        self.assertEqual(r.n1.snapshot()["nonces"][nonce]["replays"], 1)
+
+    def test_the_second_appearance_is_refused_for_another_body(self):
+        r, prompt, nonce = self.second_appearance_refusals("body")
+        inner = shared.parse_envelope(prompt)[1]
+        r.submit(shared.wrap_prompt(nonce, inner + " changed"))
+        self.assertEqual(r.n1.snapshot()["nonces"][nonce]["replays"], 1)
 
     def test_a_service_line_that_cannot_be_sent_is_logged_and_the_route_stays_cut(self):
         r = self.rig
@@ -648,6 +682,135 @@ class AuthorisationAtEverySendTests(DirectCase):
         r.say("[tg] a normal answer")
         r.tick()
         self.assertEqual(r.client.sent, [])
+
+
+class PartialAuthorisationTests(DirectCase):
+    def long_result(self):
+        return ("x" * 4000 + "\n") * 2                               # two chunks
+
+    def test_authorisation_revoked_between_chunk_one_and_two_stops_the_rest(self):
+        r = self.rig
+        r.tg_turn(OWNER, "A")
+        r.launch("tA")
+        r.end_turn()
+        r.notify("tA")
+        real = r.client.send_message
+        sent = []
+
+        def revoke_after_first(chat, text, parse_mode=None):
+            sent.append(text)
+            real(chat, text, parse_mode)
+            r.bridge._allowed.discard(OWNER)
+        r.client.send_message = revoke_after_first
+        r.say("[tg] " + self.long_result())
+        r.tick()
+        r.tick()
+        self.assertEqual(len(sent), 1, "chunk two is never sent")
+        self.assertEqual(r.job("tA"), "delivered", "chunk one was confirmed before the revocation")
+        self.assertEqual(r.n1.snapshot()["sends"], {})
+        r.bridge._allowed.add(OWNER)
+        r.tick()
+        self.assertEqual(len(sent), 1, "and not later either")
+
+    def test_authorisation_revoked_between_two_files_stops_the_second(self):
+        r = self.rig
+        outbox_dir = r.bridge.cfg.path_outbox()
+        outbox_dir.mkdir(parents=True, exist_ok=True)
+        files = []
+        for name in ("one.txt", "two.txt"):
+            (outbox_dir / name).write_text(name)
+            files.append(outbox_dir / name)
+        sent_files = []
+
+        def send_file(chat, path, *a, **k):
+            sent_files.append(Path(path).name)
+            r.bridge._allowed.discard(OWNER)
+        r.client.send_file = send_file
+        r.tg_turn(OWNER, "A")
+        r.bridge._pending_files = [str(f) for f in files]
+        r.bridge._send_files([str(f) for f in files])
+        self.assertEqual(sent_files, ["one.txt"])
+
+    def test_no_service_line_or_refusal_goes_to_a_chat_that_is_no_longer_authorised(self):
+        r = self.rig
+        r.tg_turn(OWNER, "chat A")
+        self.assertTrue(r.tg(GROUP, "chat B"))
+        r.bridge._allowed.discard(OWNER)
+        with self.assertLogs(attach_mod.log, level="WARNING") as logs:
+            self.queue()                                               # cut: A is revoked, B (a group) is not
+        self.assertEqual(r.sent_to(OWNER), [])
+        self.assertTrue(any("chat not authorised" in line for line in logs.output), logs.output)
+
+
+class AtomicConfirmationTests(DirectCase):
+    def routed(self):
+        r = self.rig
+        r.tg_turn(OWNER, "A")
+        r.launch("tA")
+        r.end_turn()
+        r.notify("tA")
+        return r
+
+    def test_a_crash_after_the_intent_and_before_the_enqueue_leaves_an_orphan_that_resolves_to_uncertain(self):
+        r = self.routed()
+        outbox = r.bridge._ensure_outbox()
+
+        class Crash(BaseException):
+            pass
+
+        def crash(*a, **k):
+            raise Crash()
+        outbox.enqueue = crash
+        with self.assertRaises(Crash):
+            r.say(RESULT)
+        self.assertEqual(len(r.n1.snapshot()["sends"]), 1, "the intent was written first")
+        r.new_bridge()
+        self.assertEqual(r.n1.snapshot()["sends"], {}, "an orphan intent is dropped at the restart")
+        self.assertEqual(r.job("tA"), "uncertain")
+        r.tick()
+        self.assertEqual(r.client.sent, [])
+
+    def test_a_crash_between_the_confirmed_chunk_and_the_state_write_resolves_to_delivered_at_the_restart(self):
+        r = self.routed()
+
+        class Crash(BaseException):
+            pass
+
+        def crash(*a, **k):
+            raise Crash()
+        r.say(RESULT)
+        r.n1.confirm_key = crash
+        with self.assertRaises(Crash):
+            r.tick()                                                   # Telegram confirmed the chunk, the process died
+        self.assertEqual(r.sent_to(OWNER).count(RESULT), 1)
+        r.new_bridge()
+        self.assertEqual(r.job("tA"), "delivered", "the part was confirmed in the outbox: resolved from it")
+        self.assertEqual(r.n1.snapshot()["sends"], {})
+        r.tick()
+        self.assertEqual(r.sent_to(OWNER).count(RESULT), 1)
+
+    def test_the_binding_and_the_job_state_change_in_one_write(self):
+        r = self.routed()
+        r.say(RESULT)
+        before = r.n1.snapshot()
+        self.assertEqual(len(before["sends"]), 1)
+        real_write = r.n1._write
+        calls = []
+
+        key = next(iter(before["sends"]))
+
+        def failing_write(state):
+            if key in state["sends"]:
+                return real_write(state)                               # an unrelated write (offset, ...)
+            calls.append(state["jobs"]["tA"]["state"])                 # the confirmation: binding gone ...
+            raise shared.StateError("disk full")
+        r.n1._write = failing_write
+        r.tick()                                                       # the send is confirmed, the single write fails
+        r.n1._write = real_write
+        self.assertEqual(calls, ["delivered"], "ONE write carries both the binding removal and the delivered state")
+        after = r.n1.snapshot()
+        self.assertEqual((after["jobs"]["tA"]["state"], len(after["sends"])), ("claimed", 1),
+                         "neither half was applied")
 
 
 if __name__ == "__main__":
