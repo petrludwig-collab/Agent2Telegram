@@ -1712,9 +1712,12 @@ class AttachBridge:
         if not self._owner_chat:
             return
         now = time.monotonic()
-        if now - self._last_pane_warning < 60:
-            return
-        self._last_pane_warning = now
+        # Explicit-only: every rejected message gets its fixed explanation (the reply is a short
+        # constant, nothing to flood-protect). Default mode keeps the 60 s throttle.
+        if not self._explicit_only:
+            if now - self._last_pane_warning < 60:
+                return
+            self._last_pane_warning = now
         try:
             if self._explicit_only:
                 self.tg.send_service(op.UnsafePane(self._owner_chat))

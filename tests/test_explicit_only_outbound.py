@@ -625,6 +625,39 @@ class ServiceErrorsThroughRealHandlers(Base):
         self.assertFalse(b._handle(self.msg("hello there")))
         self.assertOneFixedReply(b, self.PANE)
 
+    def test_unsafe_pane_every_rejected_message_is_explained(self):
+        """The 60 s warning throttle must not silence a rejected message in ON mode."""
+        b = self.bridge()
+        b._session.error = SessionError("refusing to inject PRIVATE-PANE-DETAIL")
+        self.assertFalse(b._handle(self.msg("first message")))
+        self.assertFalse(b._handle(self.msg("second message")))
+        self.assertEqual(self.rec.texts(), [self.PANE, self.PANE])
+        self.assertEqual(len(self.rec.content()), 2)
+        self.assertEqual(b._session.injected, [])
+        self.assertFalse(b._turn_active.is_set())
+
+    def test_other_service_errors_are_not_suppressed_when_repeated(self):
+        b = self.bridge(elevenlabs_api_key="k")
+        self.rec.fail_file_path = True
+        with mock.patch.object(attach_mod, "INJECT_RETRY_WAIT", 0):
+            for _ in range(2):
+                b._handle(self.msg(document={"file_id": "d", "file_size": 10}))
+                b._handle(self.msg(voice={"file_id": "v", "file_size": 10}))
+            self.rec.fail_file_path = False
+            b._session.error = RuntimeError("x")
+            for _ in range(2):
+                b._handle(self.msg("hello"))
+        self.assertEqual(self.rec.texts(), [self.DOWNLOAD, self.STT] * 2 + [self.INJECT] * 2)
+
+    def test_restart_notice_without_owner_chat_does_not_raise_or_send(self):
+        b = self.bridge(restart_notice=True)
+        b._owner_chat = None
+        attach_mod.restart_notice(b, b._owner_chat)
+        self.assertEqual(self.rec.content(), [])
+        self.assertEqual(list(self.state.glob("last_start_notified_*")), [], "no cooldown claimed")
+        self.assertFalse(getattr(b, "_restart_notice_attempted", False))
+        self.assertEqual(b.tg.denied, [])
+
     def test_attachment_download_failure(self):
         b = self.bridge()
         self.rec.fail_file_path = True
@@ -702,6 +735,48 @@ class ServiceErrorsThroughRealHandlers(Base):
         self.assertEqual(len(self.rec.content()), 1)
 
 
+class ScanQueuesBounded(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.legacy = self.root / "outbound_queue_t.jsonl"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def scan(self):
+        sizes = []
+        real_open = open
+        class Spy:
+            def __init__(self, fh): self.fh = fh
+            def __enter__(self): self.fh.__enter__(); return self
+            def __exit__(self, *a): return self.fh.__exit__(*a)
+            def read(self, n=-1):
+                sizes.append(n)
+                return self.fh.read(n)
+        with mock.patch.object(op, "open", lambda *a, **k: Spy(real_open(*a, **k)), create=True):
+            found = op.scan_queues(self.root, self.legacy)
+        return found, sizes
+
+    def test_whitespace_only_file_is_empty_and_read_in_chunks(self):
+        self.legacy.write_bytes(b" \n\t\r\n" * 200_000)           # ~800 KB of whitespace
+        found, sizes = self.scan()
+        self.assertEqual(found, [])
+        self.assertTrue(sizes and all(0 < n <= 65536 for n in sizes), sizes)
+
+    def test_large_file_is_pending_and_decided_without_reading_it_all(self):
+        self.legacy.write_bytes(b"   " + b'{"text": "x"}\n' + b"y" * 3_000_000)
+        found, sizes = self.scan()
+        self.assertEqual(found, [str(self.legacy)])
+        self.assertEqual(len(sizes), 1)                              # first chunk already decides
+        self.assertTrue(all(0 < n <= 65536 for n in sizes))
+
+    def test_record_after_a_long_whitespace_prefix_is_found(self):
+        self.legacy.write_bytes(b"\n" * 100_000 + b"{}")
+        found, _ = self.scan()
+        self.assertEqual(found, [str(self.legacy)])
+
+
 class ServiceErrorsOffParity(Base):
     """Flag off: the same four failures keep their ORIGINAL (richer) wording. Runs unchanged on
     the base SHA."""
@@ -740,6 +815,13 @@ class ServiceErrorsOffParity(Base):
         self.assertTrue(t.startswith("⚠️ Agent2Telegram blocked a Telegram message because the "
                                      "configured tmux session no longer appears"))
         self.assertIn("refusing to inject X", t)
+
+    def test_unsafe_pane_throttle_unchanged_in_default_mode(self):
+        b = self.bridge()
+        b._session.error = SessionError("refusing to inject X")
+        b._handle(self.msg("one"))
+        b._handle(self.msg("two"))
+        self.assertEqual(len(self.sent(b)), 1)
 
     def test_download_failure_text_unchanged(self):
         b = self.bridge()

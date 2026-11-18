@@ -26,6 +26,9 @@ EXIT_QUEUE_PRESENT = 3
 #: Bot API methods the guard lets through untouched (read/control, no user-visible content).
 _PASS_METHODS = frozenset({"getUpdates", "getMe", "getFile"})
 
+#: Read size of the legacy-queue check (it never loads the whole file).
+_SCAN_CHUNK = 4096
+
 _AGENT_LABELS = {"codex": "Codex", "claude-code": "Claude Code"}
 
 
@@ -333,8 +336,14 @@ def scan_queues(queue_root, legacy_queue_path) -> list[str]:
             else:
                 try:
                     with open(legacy, "rb") as fh:
-                        if fh.read().strip():
-                            found.append(legacy)
+                        # bounded chunks: a huge file is decided at its first non-whitespace byte
+                        while True:
+                            chunk = fh.read(_SCAN_CHUNK)
+                            if not chunk:
+                                break
+                            if chunk.strip():
+                                found.append(legacy)
+                                break
                 except OSError:
                     found.append(legacy)
     return sorted(set(found))
