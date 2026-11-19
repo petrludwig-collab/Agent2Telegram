@@ -32,6 +32,7 @@ from pathlib import Path
 
 from . import adapters
 from . import readers
+from . import shared_session as shared
 from .background import SubagentWatcher, _epoch as _record_wall_time
 from . import tts
 from .compat import AlreadyRunning, single_instance_lock
@@ -265,10 +266,22 @@ class AttachBridge:
     #: Durable outbox with per-part confirmation. Off by default for objects built without
     #: __init__ (focused tests), which have no queue path to write to.
     _use_durable_outbox = True
+    # Shared-session (N1) delivery of background results. Class-level defaults so objects built
+    # without __init__ (focused tests) behave as "feature off".
+    _n1 = None                  # shared_session.SharedSession, None = off (the default)
+    _n1_gate = None             # RLock: route changes of the transcript thread and the inbound thread
+    _n1_last_rec = 0.0          # monotonic ts of the last transcript content (last-resort idle fallback)
+    _hold_next_turn = False     # while a turn is being finished, the drain stops before the record that starts the NEXT turn
+    _own_turn_read = False      # shared session: evidence that the turn being finished was read to its end (its summary chain / the next boundary)
+    _own_tip = None             # uuid of the last output record read since the current route opened (the record a summary must hang on)
+    _marker_seen = None         # the content of the Stop marker the current evaluation read: the only one this turn end may consume
+    _route = None               # shared_session.Route: THE routing state of the running turn (ON only)
 
     def __init__(self, cfg: Config, *, client: TelegramClient | None = None) -> None:
         if not cfg.tmux_session:
             raise ValueError("attach mode requires 'tmux_session' in config")
+        if getattr(cfg, "shared_session_delivery", False) is True:
+            shared.validate_config(cfg)          # an unusable configuration is refused before any effect
         self.cfg = cfg
         self.tg = client or TelegramClient(cfg.token)
         self._reaction_seen: dict = {}   # (chat, msg, emoji) -> first reaction timestamp
@@ -338,6 +351,15 @@ class AttachBridge:
         self._status_path = (self._signal.parent / "status_bubble") if self._signal else None
         # Same for the background progress message (per bridge, like the heartbeat).
         self._bg_state_path = (self._signal.parent / f"background_progress_{_slug}") if self._signal else None
+        if getattr(cfg, "shared_session_delivery", False) is True:
+            self._n1_gate = threading.RLock()
+            self._route = shared.Route()
+            self._n1 = shared.SharedSession(
+                self._signal.parent / f"shared_session_{_slug}.json",
+                nonce_ttl=cfg.shared_session_nonce_ttl, job_ttl=cfg.shared_session_job_ttl,
+                authorised=self._n1_chat_authorised)
+            self._n1.load()
+            self._reader = shared.EnvelopeReader(self._reader)
         self._seen_tools: set = set()
         self._tui_seen: set = set()          # Codex TUI scrape: tool lines already shown this turn
         self._turn_text_sent = False         # has any text been forwarded this turn (bubble gate)
@@ -623,7 +645,9 @@ class AttachBridge:
         # of the current turn so a reply written while we were restarting still gets forwarded —
         # the ledger dedups, so nothing already delivered is re-sent. On the very first run we do
         # NOT rewind, so attaching to an already-busy session never re-posts its prior turn.
-        if self._transcript and self._transcript.exists():
+        if self._n1 is not None:
+            self._n1_startup()
+        elif self._transcript and self._transcript.exists():
             self._tpos = self._transcript.stat().st_size
             if self._sent_keys:
                 self._resume_position()
@@ -922,7 +946,12 @@ class AttachBridge:
         """Forward one reply RELIABLY. Marks the dedup ledger only AFTER a confirmed send; on any
         send failure the reply is queued to disk and the outbound loop keeps retrying until Telegram
         confirms. Order is preserved: if anything is already queued, this appends behind it."""
+        self._n1_pin_owner()
         text, target = self._route_group_marker(text)
+        if self._n1 is not None and not self._n1_forward_ok(target):
+            self._n1_dropped("send")                    # shared session: the ONE gate for every send
+            self._pending_files = []
+            return
         if target is None or (not text and not getattr(self, "_pending_files", None)):
             return
         if key and key in self._sent_keys:
@@ -938,6 +967,7 @@ class AttachBridge:
                 if key:
                     self._mark_sent(key)
                 self._turn_text_sent = True
+                self._n1_confirm(self._n1_job_now(), target)
                 return
             else:
                 text = f"🗣️→📝 (voice unavailable — sent as text)\n{text}"
@@ -965,11 +995,23 @@ class AttachBridge:
         if outbox is not None:
             chunks = split_message(text) if text else []
             files = list(getattr(self, "_pending_files", []) or [])
+            job = self._n1_job_now()
+            if job and (chunks or files):
+                # The INTENT is persisted first (outbox key -> job/chat), then the reply is stored: a crash between the
+                # two cannot lose the binding. delivered only when Telegram confirms (one atomic write).
+                key = key or f"n1-{shared.new_nonce()}"
+                if not self._n1.bind_send(key, job, target):
+                    self._n1_dropped("result reply (intent not stored)")
+                    self._pending_files = []
+                    return
             try:
                 outbox.enqueue(chunks, files, key, chat=target)
             except Exception as e:
+                if job:
+                    self._n1.abort_send(key)
                 log.error("could not persist the outgoing reply, falling back to the old path: %s", e)
             else:
+
                 self._pending_files = []
                 if turn_text:
                     # For the backstop the reply is handled once it is durably stored.
@@ -983,6 +1025,7 @@ class AttachBridge:
         if self._pending_send:                       # something already waiting → keep FIFO order
             self._enqueue(text, key, turn_text=turn_text, **extra)
             return
+        job_now = self._n1_job_now()
         try:
             self.tg.send_message(target, text)
         except Exception as e:                        # network reset, 5xx after retries, etc.
@@ -990,6 +1033,7 @@ class AttachBridge:
                         type(e).__name__, message_metadata(text))
             self._enqueue(text, key, turn_text=turn_text, **extra)
             return
+        self._n1_confirm(job_now, target)
         if key:
             self._mark_sent(key)
         if turn_text:
@@ -1044,8 +1088,14 @@ class AttachBridge:
             # private reply into a group once a group message arrived in between (audit
             # 2026-10-10). Legacy records without a stored chat keep the old behaviour.
             chat = rec.chat if rec.chat is not None else self._legacy_chat()
+            if self._n1_revoked_drop(outbox, rec, chat):
+                continue
             # Parts already confirmed by Telegram are NOT resent — only the remaining ones.
+            revoked = False
             for index, chunk in rec.pending_chunks:
+                if self._n1_revoked(chat):                  # re-checked for EVERY part
+                    revoked = True
+                    break
                 try:
                     self.tg.send_message(chat, chunk)
                 except Exception as e:
@@ -1053,8 +1103,15 @@ class AttachBridge:
                                 index, type(e).__name__, message_metadata(chunk))
                     return
                 outbox.mark_chunk_sent(rec.record_id, index)
+                self._n1_confirm_record(rec, chat)
+            if revoked:
+                self._n1_revoked_drop(outbox, rec, chat, force=True)
+                continue
             gave_up = False
             for file_path in rec.pending_files:
+                if self._n1_revoked(chat):                  # and for EVERY file
+                    revoked = True
+                    break
                 try:
                     self._send_one_file(file_path, chat)
                 except Exception as e:
@@ -1079,6 +1136,10 @@ class AttachBridge:
                         break
                     return
                 outbox.mark_file_sent(rec.record_id, file_path)
+                self._n1_confirm_record(rec, chat)
+            if revoked:
+                self._n1_revoked_drop(outbox, rec, chat, force=True)
+                continue
             if gave_up:
                 continue          # the record is in dead-letter, the queue moves on
             if rec.key and not self._mark_sent(rec.key):
@@ -1357,7 +1418,7 @@ class AttachBridge:
                 # Only when no turn was running: a reaction landing mid-turn must not disarm the
                 # backstop for the real question underneath it.
                 turn_running = self._turn_active.is_set()
-                self._begin_turn()
+                self._n1_begin_turn()
                 if not turn_running:
                     self._turn_is_reaction = True
                 text = (
@@ -1366,7 +1427,10 @@ class AttachBridge:
                     f"(a few words or an emoji), nothing more.")
                 if self.cfg.inbound_sender_label:
                     text = f"{sender_label({'from': mr.get('user'), 'chat': mr.get('chat')}, self.cfg.language)} {text}"
-                return self._inject(text)
+                rchat = (mr.get("chat") or {}).get("id")
+                if self._n1 is None:
+                    return self._inject(text)
+                return self._inject(text, chat=rchat if type(rchat) is int else None)
             return True
 
         msg = upd.get("message") or upd.get("edited_message")
@@ -1397,8 +1461,11 @@ class AttachBridge:
             # recipient while a turn is still answering the previous chat – the rest of that
             # answer would land in the wrong conversation (audit 2026-10-10). Wait for the turn
             # to end first; the inbound worker is FIFO, so order is preserved.
-            self._wait_for_turn_before_chat_switch(chat_id)
-            self._owner_chat = chat_id
+            if self._n1 is None:
+                self._wait_for_turn_before_chat_switch(chat_id)
+                self._owner_chat = chat_id
+            else:
+                self._n1_enter_chat(chat_id)
 
 
         # Bridge-level slash commands (e.g. /start, /help) are answered here instead of being
@@ -1439,8 +1506,10 @@ class AttachBridge:
             text = self._limit_inbound_prompt(text, chat_id)
             if not text:
                 return True
-            self._begin_turn()
-            return self._inject(text)
+            self._n1_begin_turn()
+            if self._n1 is None:
+                return self._inject(text)           # default OFF: exactly the old call
+            return self._inject(text, chat=chat_id)
         return True
 
     def _legacy_chat(self) -> "int | None":
@@ -1544,7 +1613,7 @@ class AttachBridge:
 
     def _begin_turn(self) -> None:
         # Light "typing…" from the actual injection point.
-        self._consume_turn_end()                 # drop any stale end-marker from a prior turn
+        self._consume_turn_end()                 # drop any stale end-marker from a prior turn (shared session: no-op, only an evaluation consumes)
         path = getattr(self, "_transcript", None)
         try:
             size = path.stat().st_size if path is not None else 0
@@ -1554,7 +1623,9 @@ class AttachBridge:
         self._turn_input_boundary = (path, size, time.time())
         now = time.monotonic()
         self._turn_active.set()
-        self._turn_from_tg = True
+        # Shared session (N1): the turn becomes Telegram's only when its envelope is consumed in
+        # the transcript (or a claimed result opens it) - never merely because we typed it.
+        self._turn_from_tg = self._n1 is None or self._turn_from_tg
         self._last_activity = now
         self._turn_started = now
         self._turn_started_wall = time.time()   # records are stamped with wall-clock time
@@ -1592,7 +1663,7 @@ class AttachBridge:
             self._typing_count = 1
         log.info("TURN START t=%.2f", time.time())
 
-    def _inject(self, text: str) -> bool:
+    def _inject(self, text: str, *, chat: int | None = None) -> bool:
         """Deliver a message to the session. A failure must NEVER be silent.
 
         Previously a failed write to tmux was only logged and the message vanished — the user
@@ -1605,10 +1676,25 @@ class AttachBridge:
         """
         self._turn_active.set()
         self._last_activity = time.monotonic()   # keep typing lit from the very start
-        last_error: Exception | None = None
-        for attempt in range(1, INJECT_ATTEMPTS + 1):
+        nonce = None
+        if self._n1 is not None:
+            inbound_chat = chat if chat is not None else self._owner_chat
             try:
-                self._session.inject(text)
+                # The chat of THIS message, passed in: the shared _owner_chat may have moved meanwhile.
+                # stored BEFORE anything is typed (R8), bound to the exact body that will be typed
+                nonce = self._n1.issue(inbound_chat, shared.fingerprint(self._session.compose(text)))
+            except shared.StateError:
+                return self._n1_refuse(inbound_chat)
+        extra = {"nonce": nonce} if nonce else {}
+        # Shared session: exactly ONE attempt. A tmux write that raised may still have typed the prompt
+        # (R5/R8: no automatic retry after an uncertain effect).
+        attempts = 1 if self._n1 is not None else INJECT_ATTEMPTS
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                self._session.inject(text, **extra)
+                if nonce:
+                    self._n1.mark_typed(nonce)      # from now on only T2 bounds its wait in Claude's own queue
                 if attempt > 1:
                     log.info("inject succeeded on attempt %d", attempt)
                 return True
@@ -1617,19 +1703,25 @@ class AttachBridge:
                 if "refusing to inject" in str(e):
                     # The pane isn't running the expected agent — retrying won't help, only delay.
                     log.error("inject failed: error=%s %s", type(e).__name__, message_metadata(text))
-                    self._turn_active.clear()
+                    self._n1_release_if_idle()
+                    if nonce:
+                        self._n1.cancel(nonce)
                     self._notify_unsafe_pane(str(e))
                     return False
             except Exception as e:
                 last_error = e
-            if attempt < INJECT_ATTEMPTS:
+            if attempt < attempts:
                 self._stop.wait(INJECT_RETRY_WAIT)
         # TimeoutExpired/CalledProcessError can include the entire send-keys argv (the message).
-        log.error("inject failed after %d attempts: error=%s %s", INJECT_ATTEMPTS,
+        log.error("inject failed after %d attempts: error=%s %s", attempts,
                   type(last_error).__name__, message_metadata(text))
-        self._turn_active.clear()
+        self._n1_release_if_idle()
+        if nonce:
+            self._n1.cancel(nonce)
         self._notify_inject_failed(text, str(last_error))
-        return False
+        # Shared session: the user was told to resend; handled, never retried by the inbox
+        # (the write may have gone through).
+        return self._n1 is not None
 
     def _notify_inject_failed(self, text: str, reason: str) -> None:
         """Tell the owner their message did not get through — better twice than never."""
@@ -1670,6 +1762,240 @@ class AttachBridge:
             )
         except Exception as e:
             log.warning("unsafe-pane owner notification failed: error=%s", type(e).__name__)
+
+    # ---- shared session (N1) -------------------------------------------------
+    def _n1_chat_authorised(self, chat) -> bool:
+        """Is this chat authorised RIGHT NOW (asked again at claim time, never remembered)."""
+        if type(chat) is not int:
+            return False
+        if chat >= 0:
+            return chat in self._allowed and chat in (self.cfg.allowed_user_ids or [])
+        return chat in (getattr(self.cfg, "allowed_group_ids", None) or [])
+
+    def _n1_refuse(self, chat) -> bool:
+        """R8: the correlation cannot be stored, so the prompt is NOT typed. Tell the authorised inbound
+        chat with a fixed text (best effort). Returns True: the message is handled, retrying would only
+        repeat the notice. Never reports success."""
+        self._n1_release_if_idle()
+        log.error("shared session: prompt NOT injected, correlation state unavailable")
+        if chat is not None and self._n1_revoked(chat):
+            log.warning("shared session: refusal notice not sent: chat not authorised")
+            return True
+        if chat is not None:
+            try:
+                self.tg.send_message(chat, shared.REFUSED_TEXT)
+            except Exception as e:
+                log.warning("shared session: refusal notice not sent: error=%s", type(e).__name__)
+        return True
+
+    # The routing state of the running turn is ONE object (shared_session.Route: kind none | tg | notif | other,
+    # recipient, job, nonce, cut). It is created by _n1_enter and cleared by _n1_exit. The bridge never waits:
+    # input is injected at once, Claude orders its own queue, and the route only follows the transcript.
+    def _n1_enter(self, kind, chat=None, *, job=None, nonce=None, cut=False) -> None:
+        r = self._route
+        prev = r.prev_owner if r.kind == "notif" else None
+        if kind == "notif" and prev is None and r.kind != "notif":
+            prev = self._owner_chat                     # a result route only borrows the owner chat
+        self._route = shared.Route(kind, chat, job, nonce, cut, prev)
+        self._n1_forget_evidence()
+        if kind in ("notif", "tg"):
+            self._owner_chat = chat
+            self._turn_active.set()
+        self._turn_from_tg = kind in ("tg", "notif") and not cut
+
+    def _n1_exit(self, why: str) -> None:
+        """The only way a routing state ends."""
+        r = self._route
+        self._route = shared.Route()
+        self._n1_forget_evidence()
+        if r.prev_owner is not None:
+            self._owner_chat = r.prev_owner
+        if r.kind != "none":
+            log.info("shared session: routing released (%s)", why)
+            self._turn_from_tg = False
+            self._group_reply = None
+            self._group_files = ()
+            if r.kind in ("tg", "notif"):
+                self._turn_active.clear()
+
+    def _n1_forward_ok(self, target=None) -> bool:
+        """The ONE gate for everything that would go to Telegram: only a Telegram or claimed-result turn
+        that was not cut, and only to the recipient stored with it."""
+        r = self._route
+        if r.kind not in ("tg", "notif") or r.cut or not (target is None or target == r.chat):
+            return False
+        if not self._n1_chat_authorised(r.chat):
+            # authorisation is re-checked at every send: a revoked chat cuts the route and a claimed result is uncertain
+            self._route.cut = True
+            self._turn_from_tg = False
+            if r.job:
+                self._n1.mark_uncertain(r.job)
+            log.warning("shared session: chat no longer authorised -> route stopped")
+            return False
+        return True
+
+    def _n1_revoked(self, chat) -> bool:
+        return self._n1 is not None and not self._n1_chat_authorised(chat)
+
+    def _n1_revoked_drop(self, outbox, rec, chat, force=False) -> bool:
+        """Authorisation is checked at the moment of the send: a revoked chat gets nothing more, the rest of the stored
+        reply goes to dead-letter (never sent later), and a still claimed result job is uncertain."""
+        if not (force or self._n1_revoked(chat)):
+            return False
+        if rec.key:
+            self._n1.abort_send(rec.key)
+        outbox.give_up(rec.record_id, "chat no longer authorised")
+        log.warning("shared session: stored reply not sent, chat no longer authorised")
+        return True
+
+    def _n1_dropped(self, what: str) -> None:
+        log.info("shared session: %s not forwarded (route=%s cut=%s)", what, self._route.kind, self._route.cut)
+
+    def _n1_pin_owner(self) -> None:
+        if self._n1 is None:
+            return
+        r = self._route
+        if r.kind in ("tg", "notif") and self._owner_chat != r.chat:
+            self._owner_chat = r.chat                   # the recipient is scoped to the route, not to the last message
+
+    def _n1_begin_turn(self) -> None:
+        """Typing a message while a Telegram/result route runs must not reset that route's bookkeeping."""
+        if self._n1 is not None and self._route.kind in ("tg", "notif"):
+            return
+        self._begin_turn()
+
+    def _n1_release_if_idle(self) -> None:
+        """A failed injection ends the busy mark it set, unless a Telegram/result route is really running."""
+        if self._n1 is None or self._route.kind not in ("tg", "notif"):
+            self._turn_active.clear()
+
+    def _n1_job_now(self):
+        r = self._route if self._n1 is not None else None
+        return r.job if r is not None and r.kind == "notif" and not r.cut else None
+
+    def _n1_confirm(self, job, chat) -> None:
+        if job and self._n1 is not None:
+            self._n1.confirm_delivered(job, chat)
+
+    def _n1_confirm_record(self, rec, chat) -> None:
+        """A part of a stored reply was CONFIRMED by Telegram: only now is a result job delivered (binding removal
+        and the job state change in one state write)."""
+        if self._n1 is not None and rec.key:
+            self._n1.confirm_key(rec.key, chat)
+
+    def _n1_apply(self, out) -> None:
+        """Apply SharedSession's verdict on one transcript record. Called under ``_n1_gate``."""
+        if out.noop:
+            return
+        turn = None if out.blocked else out.turn
+        kind = turn["kind"] if turn else None
+        r = self._route
+        if out.claim:                                   # the harness started processing a bound completion
+            self._n1_hand_over(r, "notif", None, out.claim["task"])
+            self._n1_enter("notif", out.claim["chat"], job=out.claim["task"])
+            self._begin_turn()
+            return
+        if kind in ("tg", "notif"):
+            if out.changed or r.kind != kind or r.cut != bool(turn.get("cut")):
+                self._n1_hand_over(r, kind, turn.get("nonce"), turn.get("job"))
+                self._n1_enter(kind, turn["chat"], job=turn.get("job"), nonce=turn.get("nonce"),
+                               cut=bool(turn.get("cut")))
+            for chat in out.cut_chats:
+                self._n1_service_line(chat, shared.ROUTE_SWITCH_RUNNING if chat == turn["chat"]
+                                      else shared.ROUTE_SWITCH_QUEUED)
+        elif kind == "other":
+            if r.kind != "other":
+                self._n1_exit("non-Telegram record")
+                self._route = shared.Route("other")
+        elif r.kind in ("tg", "notif", "other"):
+            self._n1_exit("no turn")
+
+    def _n1_hand_over(self, old, kind, nonce, job) -> None:
+        """A new turn starts while the previous Telegram/result route is still the current one (no Stop was seen yet): the
+        previous answer is final now, so what it still buffers (a group's final text / files, withheld until the turn end)
+        goes to ITS recipient at this boundary (the gate re-checks authorisation and the cut), never to the new one, and
+        never twice. The new turn starts with clean per-turn flags."""
+        if old.kind not in ("tg", "notif") or (old.kind, old.nonce, old.job) == (kind, nonce, job):
+            return                                      # nothing before it, or the same turn (e.g. only a cut changed)
+        self._turn_tpos = getattr(self, "_n1_rec_off", self._turn_tpos)   # the new turn's backstop must not read the old turn's text
+        reply, self._group_reply = self._group_reply, None
+        files, self._group_files = tuple(self._group_files or ()), ()
+        if reply is not None or files:
+            if files:
+                self._pending_files = list(getattr(self, "_pending_files", []) or []) + list(files)
+            # the route is still the old one here: the single send gate re-checks authorisation and the cut for ITS chat
+            self._send_final(reply[0] if reply is not None else "", key=reply[1] if reply is not None else None)
+        self._turn_text_sent = False
+
+    def _n1_service_line(self, chat, text) -> None:
+        """One fixed line to a chat whose answer was stopped. Best effort: a failure is logged explicitly (the
+        forwarding stays stopped either way) and never reported as success."""
+        if chat is not None and self._n1_revoked(chat):
+            log.warning("shared session: service line to chat %s NOT delivered: chat not authorised", chat)
+            return
+        if chat is not None:
+            try:
+                self.tg.send_message(chat, text)
+            except Exception as e:
+                log.error("shared session: service line to chat %s NOT delivered (error=%s); forwarding stays stopped",
+                          chat, type(e).__name__)
+
+    def _n1_enter_chat(self, chat_id) -> None:
+        """Inbound message of ``chat_id``: injected at once, never waits. It does not change the recipient of a
+        running route (the route carries its own recipient); with no route it is simply the last chat."""
+        with self._n1_gate:
+            if self._route.kind not in ("tg", "notif"):
+                self._owner_chat = chat_id
+
+    def _n1_startup(self) -> None:
+        """Shared session: continue at the STORED offset (not EOF), so a completion that arrived while the
+        bridge was down is still seen; a replaced or truncated transcript revokes every binding."""
+        res = self._n1.sync_transcript(self._transcript)
+        if res is not None:
+            self._tpos = res.resume
+        turn = self._n1.turn()
+        if turn and turn["kind"] == "tg":
+            self._n1_enter("tg", turn["chat"], nonce=turn.get("nonce"), cut=bool(turn.get("cut")))
+        outbox = self._ensure_outbox()
+        if outbox is not None:
+            stored = {r.key: r for r in outbox.pending() if r.key}
+
+            def state_of(key):
+                rec = stored.get(key)
+                if rec is not None:
+                    part_sent = (len(rec.pending_chunks) < len(rec.chunks)) or (len(rec.pending_files) < len(rec.files))
+                    return "delivered" if part_sent else "pending"
+                return "delivered" if key in self._sent_keys else "orphan"
+            self._n1.reconcile(state_of)
+
+    def _n1_turn_ended(self) -> None:
+        with self._n1_gate:
+            self._n1.turn_end()
+            self._n1_exit("turn end")
+
+    def _n1_tick(self) -> None:
+        """Outbound-loop housekeeping: expiry, recovery, the last-resort idle fallback, route consistency."""
+        n1 = self._n1
+        n1.flush_offset()
+        with self._n1_gate:
+            n1.expire()
+        if n1.needs_sync():
+            res = n1.sync_transcript(self._transcript, self._tpos)
+            if res is not None and res.changed:
+                self._tpos = res.resume
+                with self._n1_gate:
+                    self._n1_exit("transcript reset")
+        turn = n1.turn()
+        if (turn is not None and not self._turn_active.is_set()
+                and time.monotonic() - self._n1_last_rec > self._idle_limit()):
+            n1.close_turn()                    # last resort only: delivery and next input never depend on it
+            turn = n1.turn()
+        with self._n1_gate:
+            r = self._route
+            if r.kind == "notif" and r.job and n1.job_state(r.job) not in ("claimed", "delivered"):
+                self._n1_exit("job is no longer claimed")        # uncertain/expired: the gate closes with it
+            elif (not n1.healthy and r.kind != "none") or (turn is None and r.kind in ("tg", "notif", "other")):
+                self._n1_exit("store unusable" if not n1.healthy else "turn closed")
 
     def _handle_command(self, text: str, chat_id: int, message_id: int | None = None) -> bool:
         """Answer a bridge-level slash command. Returns True if handled (don't forward to agent)."""
@@ -1869,12 +2195,61 @@ class AttachBridge:
                         log.debug("tui scrape: %s", e)
             self._stop.wait(1.0)
 
-    def _consume_turn_end(self) -> None:
+    def _consume_turn_end(self, seen: str | None = None) -> None:
         if self._turn_end is not None:
+            if self._n1 is not None:
+                self._consume_evaluated_marker(seen)
+                return
             try:
                 self._turn_end.unlink()
             except OSError:
                 pass
+
+    def _consume_evaluated_marker(self, seen: str | None) -> None:
+        """Shared session: remove the marker that was EVALUATED, never a newer one. The marker is first renamed to a private
+        name (atomic: it takes whatever file is at the path at that instant), and the content that is compared is the content
+        of THAT file, so the bytes compared are the bytes removed; a Stop written by the hook at any other moment lands on the
+        path afterwards and is not touched. A newer marker that was taken is given back (no-clobber: if an even newer one is
+        already there, the single-slot marker keeps only the latest)."""
+        if seen is None:
+            return
+        claim = self._turn_end.with_name(f".turn_end-consume-{os.getpid()}")
+        try:
+            os.replace(self._turn_end, claim)
+        except OSError:
+            return
+        try:
+            same = claim.read_text("utf-8") == seen
+        except (OSError, ValueError):
+            same = False
+        if not same:
+            try:
+                os.link(claim, self._turn_end)
+            except FileExistsError:
+                pass                                    # an even newer Stop is already there: it is the one that stays
+            except OSError as exc:
+                # No hard links here (or another failure): the newer Stop must not be destroyed. Place its bytes with an atomic
+                # no-clobber create (O_EXCL): if the hook published an even newer Stop meanwhile the create fails and ours is dropped;
+                # if it publishes while we are still writing, its file wins. If the create fails for another reason, keep the claim
+                # file (never read as a marker) rather than delete the only copy.
+                log.warning("shared session: could not give the newer Stop marker back with a link (%s)", exc)
+                try:
+                    data = claim.read_bytes()
+                    fd = os.open(self._turn_end, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    try:
+                        written = os.write(fd, data)
+                    finally:
+                        os.close(fd)
+                    if written != len(data):
+                        return                          # short write: keep the claim, it is the only full copy
+                except FileExistsError:
+                    pass
+                except OSError:
+                    return                              # kept as .turn_end-consume-<pid>
+        try:
+            claim.unlink()
+        except OSError:
+            pass
 
     def _last_assistant_text(self) -> str | None:
         """The most recent assistant text in the transcript (the turn's final answer). Read-only
@@ -1973,10 +2348,52 @@ class AttachBridge:
         return (getattr(self, "_transcript", None) is not None
                 or getattr(self, "_signal", None) is not None)
 
+    def _n1_forget_evidence(self) -> None:
+        self._own_turn_read = False
+        self._own_tip = None
+
+    def _n1_note_chain(self, rec) -> None:
+        """Evidence that the turn of the CURRENT route was read to its end: Claude chains its records by ``parentUuid``
+        (prompt <- assistant/attachment ... <- stop_hook_summary). A summary counts only if its parentUuid is the last output
+        record (assistant / attachment / tool result) read since this route opened, so it provably follows everything read of
+        this turn. Anything else proves nothing (the read then simply runs its bounded retry). Never raises: a malformed
+        uuid / parentUuid is no evidence."""
+        if not isinstance(rec, dict) or self._route.kind not in ("tg", "notif"):
+            return
+        uid, parent = rec.get("uuid"), rec.get("parentUuid")
+        if rec.get("type") == "system":
+            if (rec.get("subtype") == "stop_hook_summary" and isinstance(parent, str)
+                    and self._own_tip is not None and parent == self._own_tip):
+                self._own_turn_read = True
+        elif rec.get("type") in ("assistant", "attachment") or shared.classify(rec) == "tool_result":
+            self._own_tip = uid if isinstance(uid, str) else None      # an unidentifiable last output = no evidence
+
+    def _n1_read_own_turn(self) -> None:
+        """Shared session: finishing turn N reads the rest of turn N with the live reader (stopping before the record that starts
+        turn N+1), up to BACKSTOP_RETRY_ATTEMPTS times with the existing delay. It ends as soon as the own turn was read to its end
+        (its summary or the next boundary) -- NOT because some text was sent: a first text is no proof the final answer was read."""
+        self._hold_next_turn = True
+        try:
+            for attempt in range(BACKSTOP_RETRY_ATTEMPTS):
+                try:
+                    self._drain_transcript()
+                except Exception as e:
+                    log.debug("turn-end own-turn read failed: %s", e)
+                if self._own_turn_read or getattr(self, "_transcript", None) is None:
+                    break
+                if attempt != BACKSTOP_RETRY_ATTEMPTS - 1:
+                    self._wait_backstop_retry()
+        finally:
+            self._hold_next_turn = False
+
     def _finish_turn(self, *, confirmed: bool = True) -> None:
         """Drop the technical bubble and stop the typing indicator at the real end of a turn."""
+        self._n1_pin_owner()
+        marker_of_this_end, self._marker_seen = self._marker_seen, None
         self._status_clear()
         was_active = self._turn_active.is_set()
+        if self._n1 is not None and was_active and self._turn_from_tg:
+            self._n1_read_own_turn()                 # shared session: ONE read path; the buffer is taken only after it
         from_tg_at_end = self._turn_from_tg
         text_sent_at_end = self._turn_text_sent
         reaction_at_end = getattr(self, "_turn_is_reaction", False)
@@ -1995,14 +2412,20 @@ class AttachBridge:
         # or interim forwarding missed it), deliver the final assistant message now. The
         # `_turn_text_sent` guard means this only fires when truly nothing was sent (no double-send),
         # and _send_final sets it True so a second _finish_turn won't re-fire.
-        if (was_active and self._turn_from_tg and not self._turn_text_sent
+        if (self._n1 is None and was_active and self._turn_from_tg and not self._turn_text_sent
                 and not getattr(self, "_turn_is_reaction", False)
                 and self._owner_chat is not None
                 and getattr(self, "_turn_end_backstop_enabled", True)):
             source = "transcript"
             out = ""
             if self._has_turn_end_backstop_source():
-                last = self._retry_last_assistant_text()
+                # Finishing turn N may read the rest of turn N (its final answer), never the record that starts turn N+1: that
+                # record opens the next route, which this finishing (turn_end / exit / active flags below) would then release.
+                self._hold_next_turn = self._n1 is not None
+                try:
+                    last = self._retry_last_assistant_text()
+                finally:
+                    self._hold_next_turn = False
                 out = self._strip_marker(last) if last else ""
                 if not out and not self._turn_text_sent:
                     source = "signal"
@@ -2023,6 +2446,14 @@ class AttachBridge:
                           "signal_configured=%s",
                           dur, self._typing_count, getattr(self, "_transcript", None) is not None,
                           getattr(self, "_signal", None) is not None)
+        elif (self._n1 is not None and was_active and self._turn_from_tg and not self._turn_text_sent
+                and not getattr(self, "_turn_is_reaction", False) and self._owner_chat is not None):
+            # Shared session: no second reader. What the own-turn read delivered is all there is; files alone still go out.
+            if getattr(self, "_pending_files", None):
+                self._send_final("")
+            else:
+                log.error("TURN END: Telegram turn ended without an answer (shared session, own turn read to its end: %s)",
+                          self._own_turn_read)
         elif (was_active and self._turn_from_tg and not self._turn_text_sent
                 and self._owner_chat is not None
                 and not getattr(self, "_turn_is_reaction", False)):
@@ -2040,7 +2471,7 @@ class AttachBridge:
         self._turn_active.clear()
         self._group_end_confirmed = False
         self._pending_turn_end = False
-        self._consume_turn_end()
+        self._consume_turn_end(marker_of_this_end)
         if was_active:
             # from_tg/text_sent are in the line on purpose: when a reply goes missing, these two
             # flags decide whether anything was even attempted, and reconstructing them
@@ -2050,17 +2481,29 @@ class AttachBridge:
                      time.time(), time.monotonic() - self._turn_started,
                      self._typing_count, self._max_gap, from_tg_at_end, text_sent_at_end,
                      reaction_at_end)
+        if self._n1 is not None:
+            self._n1_turn_ended()
 
     def _end_turn(self, *, confirmed: bool = True, from_hook: bool = False) -> None:
         # Claude Stop-hook path: catch anything written just before the hook fired, then finish.
         boundary = getattr(self, "_turn_input_boundary", None)
         self._drain_transcript()
         has_marker = self._turn_end is not None and self._turn_end.exists()
-        if (boundary is not getattr(self, "_turn_input_boundary", None)
-                or (from_hook and not has_marker)
+        try:                                     # bind the marker this end acts on BEFORE any early return in the evaluation
+            self._marker_seen = self._turn_end.read_text("utf-8") if has_marker else None
+        except OSError:
+            self._marker_seen = None
+        if boundary is not getattr(self, "_turn_input_boundary", None):
+            # A new turn began during this evaluation: the marker may be ITS Stop. No ownership decision was made, so nothing
+            # is consumed; the next pass judges it against the now-current turn (uuid rule) and consumes it if stale.
+            log.info("turn end ignored: it does not belong to the current Telegram input")
+            self._marker_seen = None
+            return
+        if ((from_hook and not has_marker)
                 or (has_marker and not self._hook_ends_current_turn())):
             log.info("turn end ignored: it does not belong to the current Telegram input")
-            self._consume_turn_end()
+            seen, self._marker_seen = self._marker_seen, None
+            self._consume_turn_end(seen)
             return
         if confirmed:
             self._finish_turn()
@@ -2069,6 +2512,21 @@ class AttachBridge:
 
     def _prompt_belongs_to_turn(self, path: Path, offset: int, rec: dict) -> bool:
         """A turn may end only after its own Telegram input reached the transcript."""
+        if self._n1 is not None and self._route.kind in ("tg", "notif"):
+            turn = self._n1.turn()                  # identity of a shared-session route (also after a restart)
+            if turn and turn["kind"] == "notif":
+                # A claimed result turn is started by the task-notification record itself: the Stop hook of THAT
+                # turn names this record as its prompt (the Stop of the previous turn names an older one).
+                return rec.get("uuid") == turn.get("uuid")
+            if turn and turn["kind"] == "tg" and turn.get("uuid"):
+                # A Telegram route ends only with the Stop of the turn that ITS opening record started. The Stop marker of
+                # an OLDER turn names an older prompt: with a follow-up that Claude runs as its own turn right after the
+                # previous one (promptSource queued), that stale marker must not cancel the new answer.
+                if turn.get("anchor"):
+                    # opened by a queued_command inside a running turn: ended by the Stop naming the prompt that started
+                    # THAT turn (the anchor) or this record, nothing older
+                    return rec.get("uuid") in (turn["uuid"], turn["anchor"])
+                return rec.get("uuid") == turn["uuid"]
         boundary = getattr(self, "_turn_input_boundary", None)
         if not self._turn_active.is_set() or boundary is None:
             return True  # no injected turn to protect (e.g. startup/background cleanup)
@@ -2085,7 +2543,8 @@ class AttachBridge:
         return old_path is not None and path.resolve() == old_path.resolve() and offset >= size
 
     def _hook_ends_current_turn(self) -> bool:
-        if not self._turn_active.is_set() or getattr(self, "_turn_input_boundary", None) is None:
+        owned = self._n1 is not None and self._route.kind in ("tg", "notif")     # its identity is checked even after a restart
+        if not self._turn_active.is_set() or (getattr(self, "_turn_input_boundary", None) is None and not owned):
             return True
         try:
             content = self._turn_end.read_text("utf-8")
@@ -2120,6 +2579,8 @@ class AttachBridge:
                 self._flush_pending()         # re-deliver any reply a prior send failed to push
                 self._drain_transcript()      # may set _pending_turn_end (Codex task_complete)
                 self._drain_signal()
+                if self._n1 is not None:
+                    self._n1_tick()
                 # End-of-turn detection, in priority order:
                 #   * Codex: the reader saw task_complete → end now (no hook needed).
                 #   * Claude Code: the Stop hook wrote the end-of-turn marker. Authoritative even
@@ -2240,6 +2701,8 @@ class AttachBridge:
 
     # ---- live tool-call status bubble (shown during the turn, deleted at the end) ------
     def _status_push(self, line: str, *, background: bool = False) -> None:
+        if self._n1 is not None and not self._n1_forward_ok():
+            return
         if not self._interim_allowed(self._owner_chat):
             return
         # Single line, emoji at the start, rendered in italics. One bubble is edited in place
@@ -2329,6 +2792,14 @@ class AttachBridge:
         if not self._transcript or not self._transcript.exists():
             return
         size = self._transcript.stat().st_size
+        n1 = self._n1
+        if n1 is not None:
+            # identity (inode + head hash) and size against what was already READ, every time
+            res = n1.sync_transcript(self._transcript, self._tpos)
+            if res is not None and res.changed:
+                self._tpos = res.resume
+                with self._n1_gate:
+                    self._n1_exit("transcript reset")        # bindings revoked: routing must follow at once
         if size < self._tpos:          # file rotated/truncated
             self._tpos = 0
         if size == self._tpos:
@@ -2352,7 +2823,26 @@ class AttachBridge:
                 try:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
-                    continue
+                    rec = None
+                    if n1 is None:
+                        continue
+                if n1 is not None and self._hold_next_turn and (
+                        not isinstance(rec, dict) or shared.classify(rec) in ("human", "foreign", "notification")):
+                    self._tpos = rec_off          # left for the normal drain: it starts the next turn, not this finishing
+                    self._own_turn_read = True    # the next turn's record: everything of the turn being finished was read
+                    break
+                if n1 is not None:
+                    if not isinstance(rec, dict):
+                        # A complete line that cannot be read stands for a lost record (maybe a switch to
+                        # the terminal): the origin is no longer known, so it closes the Telegram window.
+                        log.warning("shared session: unreadable transcript line -> origin closed")
+                        rec = shared.UNREADABLE_RECORD
+                    with self._n1_gate:
+                        self._n1_rec_off = rec_off
+                        self._n1_apply(n1.on_record(rec_off, off, rec))
+                    if rec is shared.UNREADABLE_RECORD:
+                        continue
+                    self._n1_note_chain(rec)
                 self._rec_live = self._record_is_live(rec_off, rec)
                 # Prompt identity is independent of reader delivery dedup: the user can
                 # legitimately repeat the same question in a later turn.
@@ -2371,6 +2861,9 @@ class AttachBridge:
                     self._handle_event(ev)
         finally:
             self._rec_live = False
+            if n1 is not None:
+                self._n1_last_rec = time.monotonic()
+                n1.advance(self._tpos)
         # Any new transcript content during a Telegram turn = the agent is still working; refresh
         # activity so the idle fallback doesn't fire prematurely.
         if self._turn_from_tg:
@@ -2416,7 +2909,13 @@ class AttachBridge:
     def _send_files(self, paths: list[str]) -> None:
         """Upload the requested files. A rejection is always reported back to the chat —
         silently dropping an attachment would be worse than a visible error."""
+        if getattr(self, "_n1", None) is not None and not self._n1_forward_ok():
+            self._n1_dropped("files")
+            return
         for raw in paths:
+            if getattr(self, "_n1", None) is not None and not self._n1_forward_ok():
+                self._n1_dropped("files")                   # authorisation is re-checked for EVERY file
+                return
             resolved, reason = self._safe_outbox_path(raw)
             if resolved is None:
                 log.warning("refusing to send %s: %s",
@@ -2502,6 +3001,13 @@ class AttachBridge:
 
     def _handle_event(self, ev) -> None:
         """Apply one normalized reader event to the Telegram side."""
+        self._n1_pin_owner()
+        if ev.kind == "user" and self._n1 is not None:
+            return                              # shared session: SharedSession decided the turn's origin
+        if self._n1 is not None and ev.kind in ("text", "tool", "files") and not self._n1_forward_ok():
+            if ev.kind == "text" and ev.text.strip():
+                self._n1_dropped("event")       # terminal / cut / unbound turn: nothing is forwarded
+            return
         if ev.kind == "user":
             # Remember whether this turn came from Telegram (origin prefix) — only those are
             # forwarded; terminal-originated turns stay local.

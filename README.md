@@ -369,6 +369,44 @@ is shown for history replayed at startup. `"background_edit_interval"` (seconds,
 throttles edits; `"background_stale_after"` (default 300) drops progress that went silent. The
 labels follow `"language"`. The default is off.
 
+Background results in a shared session (attach mode, Claude Code): `"shared_session_delivery": true`
+delivers the result of a background task that a Telegram message started to THAT chat, while the same
+session stays fully usable over SSH/tmux. It needs `"mode": "attach"`, the `claude-code` agent,
+`"reply_to_origin_chat": true`, a `signal_file` and the Stop hook; a group counts only when it is listed
+in `"allowed_group_ids"`. The default is off, and when off nothing changes (no envelope, no state file).
+How it works: Telegram and SSH/tmux are two entrances to ONE conversation; mixing them is fine and the bridge never
+waits. Every Telegram message is typed into the session at once, wrapped in a one-time envelope
+(`<a2t:N>...</a2t:N>`, N = 128 random bits, stored before typing, bound to the exact typed body). Claude orders its own
+queue; the transcript shows what it took: a `human` record, or, when it arrived during a running turn, an `attachment`
+of type `queued_command`. One envelope with a matching body in either consumes the nonce (other text around it is terminal typing: mixing is allowed;
+two envelopes or a changed body are not Telegram input), and a second appearance of the same input is accepted only as the
+queued -> `human` transition (same session, same body, within the long bound, before any transcript reset), any other repeat is a replay. A bridge tag that cannot be validated while a route is
+running stops that route, like input of another chat; only a `human` record starts a new Telegram
+route, a queued one never starts a new answer. Background tasks launched inside a Telegram route are bound to its chat.
+When the harness itself starts processing a completion (a `task-notification` user record) of a bound, valid, still
+authorised job, that record starts a result route for the job's own chat (durable claim first) and the agent's answer
+goes there. `delivered` is set only when Telegram confirms the send of at least one result text; a route that ends
+without one (next turn boundary, Stop hook) leaves the job `uncertain`, which is never retried. A notification of an
+unbound, terminal, expired or foreign job starts no Telegram route. Terminal input never inherits a Telegram origin.
+The recipient belongs to the route: a message of another chat never takes over a running answer. If such a message is
+queued INSIDE a running answer, Claude will very likely answer both in the same turn, so forwarding of that answer
+stops and both chats get one fixed line (a documented decision point; no option keeps both chats correct and fully
+delivered without the bridge waiting). In this mode one gate decides every send: a terminal turn forwards nothing, not
+even an explicit marker. Authorisation is re-checked at every send, including the stored-reply drain; a stored result reply is bound to its job in
+the state file, so a confirmation after a restart or after the route ended still marks the job delivered (the existing
+outbox retry is unchanged; a lost acknowledgement can still duplicate a message, as before).
+If the state cannot be stored, the Telegram message is NOT typed into the session and the chat
+gets a fixed error; every injection is a single attempt; the terminal is never affected.
+`"shared_session_nonce_ttl"` (seconds, default 600) only cleans up a prompt whose typing never completed; a typed
+prompt may wait in Claude's own queue as long as it needs, bounded by `"shared_session_job_ttl"` (default 86400), which
+also limits how long a bound task stays deliverable. State lives in one file next to the signal file (`shared_session_<tmux>.json`).
+This is an operational correlation, not a security boundary: anyone who can already read or write the
+same account, tmux, transcript or state file can forge the envelope or the state. Besides the synthetic-transcript
+tests it was checked in one isolated live trial (Claude Code 2.1.328, local Telegram stand-in), not on other versions.
+Known limits: when a turn ends, the bridge reads the rest of that turn for a short bounded window (about 1.4 s); an
+answer that Claude writes to the transcript later than that is not forwarded (logged as "ended without an answer"), but
+text of another turn is never sent in its place. A restart in the middle of a turn ends its route as `uncertain`.
+
 ---
 
 ## Run it forever (boot + auto‑restart)

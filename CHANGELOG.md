@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Opt-in `shared_session_delivery` (default off, byte-identical when off): the result of a background task started from a
+  Telegram message is delivered once to that chat, while the same session stays usable over SSH/tmux (one conversation,
+  two entrances). The bridge forwards input at once and never waits or queues; a one-time envelope around the injected
+  prompt (bound to its exact body) is consumed from a `human` record or an `attachment` `queued_command`. A completion
+  that the harness starts processing starts a result route for the bound job's own chat; `delivered` only after a
+  confirmed send, otherwise `uncertain` (never retried). A message of another chat queued inside a running answer stops
+  forwarding of that answer (fixed line to both chats) instead of taking it over. Operational correlation only, not
+  protection against someone with the same account; checked in one isolated live trial (Claude Code 2.1.328).
 - Attach mode defaults to `group_interim: false`: group destinations receive the final
   answer and allowed attachments, with narration, tool/status bubbles, background progress,
   typing and queued-message acknowledgments suppressed. Private-chat progress is unchanged;

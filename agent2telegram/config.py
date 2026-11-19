@@ -78,6 +78,11 @@ class Config:
     background_progress: bool = False
     background_edit_interval: float = 10.0   # min seconds between edits of the progress message
     background_stale_after: float = 300.0    # silent this long → progress is dropped/deleted
+    # Attach mode, Claude Code: deliver the result of a background task launched from a Telegram
+    # turn to THAT chat (shared session with SSH/tmux; see shared_session.py). Off by default.
+    shared_session_delivery: bool = False
+    shared_session_nonce_ttl: float = 600.0    # T1: seconds from injecting a prompt to its consumption
+    shared_session_job_ttl: float = 86400.0    # T2: seconds a bound background task may stay deliverable
 
     def path_outbox(self) -> Path:
         """Default place to put files meant for Telegram."""
@@ -128,6 +133,8 @@ class Config:
             v = getattr(self, name)
             if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
                 raise ConfigError(f"'{name}' must be a positive number.")
+        from .shared_session import validate_config as _validate_shared_session
+        _validate_shared_session(self)
         if self.language not in ('en', 'cs'):
             raise ConfigError("'language' must be 'en' or 'cs'.")
         if (not isinstance(self.restart_notice_text, str) or len(self.restart_notice_text) > 200
