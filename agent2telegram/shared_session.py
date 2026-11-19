@@ -819,7 +819,10 @@ class SharedSession:
         uuid = rec.get("uuid") if isinstance(rec.get("uuid"), str) else None
         if not active:
             if turn is None or turn["kind"] == "other":
-                st["turn"] = {"kind": "tg", "chat": nrec["chat"], "nonce": consumed, "job": None, "uuid": uuid}
+                # The route is opened by a queued_command INSIDE a running turn: that turn's own prompt record (the
+                # `other` turn's opening record) is the anchor whose Stop ends it; nothing older may.
+                st["turn"] = {"kind": "tg", "chat": nrec["chat"], "nonce": consumed, "job": None, "uuid": uuid,
+                              "anchor": turn.get("uuid") if turn else None}
         elif turn["chat"] != nrec["chat"]:
             was_cut = bool(turn.get("cut"))
             turn["cut"] = True

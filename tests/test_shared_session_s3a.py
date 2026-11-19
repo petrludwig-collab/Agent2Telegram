@@ -166,5 +166,76 @@ class S3aQueueReceiptAndModesTests(RigTestCase):
         self.assertEqual(r.sent_to(OWNER).count("answer to the queued follow-up"), 1)
 
 
+class QueuedCommandRouteEndsWithItsTurnsStopTests(RigTestCase):
+    """A route opened by a queued_command during a terminal-started turn ends with the Stop of THAT turn, not by the idle wait."""
+
+    def open_route_during_a_terminal_turn(self, prompt="typed over SSH"):
+        r = self.rig
+        r.bridge._idle_limit = lambda: 10 ** 9                         # the idle fallback can never help
+        r.terminal(prompt)                                             # a terminal-started turn is running
+        self.assertTrue(r.tg(OWNER, "from Telegram into the running turn"))
+        r.append({"type": "attachment", "uuid": "qc-open", "attachment": {"type": "queued_command", "prompt": r.typed[-1]}})
+        r.drain()
+        self.assertEqual(r.bridge._route.kind, "tg")
+
+    def test_the_stop_of_the_turn_that_ran_the_queued_command_ends_the_route_and_the_answer_is_delivered(self):
+        r = self.rig
+        self.open_route_during_a_terminal_turn()
+        r.say("[tg] the common answer")
+        r.stop()                                                       # the hook names the terminal human prompt
+        r.tick()
+        r.tick()
+        self.assertEqual(r.bridge._route.kind, "none", "ended by the Stop, without any idle wait")
+        self.assertEqual(r.sent_to(OWNER), ["the common answer"])
+        self.assertIsNone(r.n1.turn())
+
+    def stale_marker(self):
+        """A Stop marker that names the OLDER terminal prompt (written by the real hook helper, as an older turn's Stop would)."""
+        from agent2telegram import stop_hook
+        from agent2telegram.readers import ClaudeCodeReader, latest_user
+        r = self.rig
+        offset, rec = latest_user(r.transcript, ClaudeCodeReader())
+        return {"transcript_path": str(r.transcript.resolve()), "user_offset": offset, "user_uuid": rec.get("uuid")}, stop_hook
+
+    def test_a_stop_naming_an_older_prompt_does_not_end_it(self):
+        r = self.rig
+        r.bridge._idle_limit = lambda: 10 ** 9
+        r.terminal("an older terminal prompt")
+        older, stop_hook = self.stale_marker()
+        self.open_route_during_a_terminal_turn("a newer terminal prompt")
+        stop_hook._mark(str(r.bridge._signal), older)                  # the Stop of the older turn arrives late
+        r.say("[tg] the answer")
+        r.tick()
+        self.assertEqual(r.bridge._route.kind, "tg", "the stale marker of an older turn must not end the newer route")
+        self.assertEqual(r.sent_to(OWNER), ["the answer"])
+        r.stop()                                                       # now the Stop of the running turn
+        r.tick()
+        self.assertEqual(r.bridge._route.kind, "none")
+
+    def test_a_restart_in_between_keeps_the_identity(self):
+        r = self.rig
+        self.open_route_during_a_terminal_turn()
+        r.new_bridge()
+        r.bridge._idle_limit = lambda: 10 ** 9
+        self.assertEqual(r.bridge._route.kind, "tg", "the stored turn carries the route over the restart")
+        r.say("[tg] answer after the restart")
+        r.stop()
+        r.tick()
+        r.tick()
+        self.assertEqual(r.bridge._route.kind, "none")
+        self.assertEqual(r.sent_to(OWNER), ["answer after the restart"])
+
+    def test_a_stale_marker_is_refused_after_a_restart_too(self):
+        r = self.rig
+        r.terminal("an older terminal prompt")
+        older, stop_hook = self.stale_marker()
+        self.open_route_during_a_terminal_turn("a newer terminal prompt")
+        r.new_bridge()
+        r.bridge._idle_limit = lambda: 10 ** 9
+        stop_hook._mark(str(r.bridge._signal), older)
+        r.tick()                                                       # the stale marker meets the restored route
+        self.assertEqual(r.bridge._route.kind, "tg", "identity survives the restart (no injected-turn boundary exists then)")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2373,12 +2373,8 @@ class AttachBridge:
 
     def _prompt_belongs_to_turn(self, path: Path, offset: int, rec: dict) -> bool:
         """A turn may end only after its own Telegram input reached the transcript."""
-        boundary = getattr(self, "_turn_input_boundary", None)
-        if not self._turn_active.is_set() or boundary is None:
-            return True  # no injected turn to protect (e.g. startup/background cleanup)
-        old_path, size, delivered_after = boundary
-        if self._n1 is not None:
-            turn = self._n1.turn()
+        if self._n1 is not None and self._route.kind in ("tg", "notif"):
+            turn = self._n1.turn()                  # identity of a shared-session route (also after a restart)
             if turn and turn["kind"] == "notif":
                 # A claimed result turn is started by the task-notification record itself: the Stop hook of THAT
                 # turn names this record as its prompt (the Stop of the previous turn names an older one).
@@ -2387,7 +2383,15 @@ class AttachBridge:
                 # A Telegram route ends only with the Stop of the turn that ITS opening record started. The Stop marker of
                 # an OLDER turn names an older prompt: with a follow-up that Claude runs as its own turn right after the
                 # previous one (promptSource queued), that stale marker must not cancel the new answer.
+                if turn.get("anchor"):
+                    # opened by a queued_command inside a running turn: ended by the Stop naming the prompt that started
+                    # THAT turn (the anchor) or this record, nothing older
+                    return rec.get("uuid") in (turn["uuid"], turn["anchor"])
                 return rec.get("uuid") == turn["uuid"]
+        boundary = getattr(self, "_turn_input_boundary", None)
+        if not self._turn_active.is_set() or boundary is None:
+            return True  # no injected turn to protect (e.g. startup/background cleanup)
+        old_path, size, delivered_after = boundary
         text = self._reader.user_text(rec)
         origins = getattr(self, "_origins", (self.cfg.origin_prefix.strip(), "Telegram:", "[TG]"))
         if not text or not text.lstrip().startswith(tuple(p for p in origins if p)):
@@ -2400,7 +2404,8 @@ class AttachBridge:
         return old_path is not None and path.resolve() == old_path.resolve() and offset >= size
 
     def _hook_ends_current_turn(self) -> bool:
-        if not self._turn_active.is_set() or getattr(self, "_turn_input_boundary", None) is None:
+        owned = self._n1 is not None and self._route.kind in ("tg", "notif")     # its identity is checked even after a restart
+        if not self._turn_active.is_set() or (getattr(self, "_turn_input_boundary", None) is None and not owned):
             return True
         try:
             content = self._turn_end.read_text("utf-8")
