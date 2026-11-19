@@ -272,6 +272,7 @@ class AttachBridge:
     _n1_gate = None             # RLock: route changes of the transcript thread and the inbound thread
     _n1_last_rec = 0.0          # monotonic ts of the last transcript content (last-resort idle fallback)
     _hold_next_turn = False     # while a turn is being finished, the drain stops before the record that starts the NEXT turn
+    _own_turn_read = False      # shared session: evidence that the turn being finished was read to its end (its summary / the next boundary)
     _marker_seen = None         # the content of the Stop marker the current evaluation read: the only one this turn end may consume
     _route = None               # shared_session.Route: THE routing state of the running turn (ON only)
 
@@ -1795,6 +1796,7 @@ class AttachBridge:
         if kind == "notif" and prev is None and r.kind != "notif":
             prev = self._owner_chat                     # a result route only borrows the owner chat
         self._route = shared.Route(kind, chat, job, nonce, cut, prev)
+        self._own_turn_read = False
         if kind in ("notif", "tg"):
             self._owner_chat = chat
             self._turn_active.set()
@@ -2344,12 +2346,32 @@ class AttachBridge:
         return (getattr(self, "_transcript", None) is not None
                 or getattr(self, "_signal", None) is not None)
 
+    def _n1_read_own_turn(self) -> None:
+        """Shared session: finishing turn N reads the rest of turn N with the live reader (stopping before the record that starts
+        turn N+1), up to BACKSTOP_RETRY_ATTEMPTS times with the existing delay. It ends as soon as the own turn was read to its end
+        (its summary or the next boundary) -- NOT because some text was sent: a first text is no proof the final answer was read."""
+        self._hold_next_turn = True
+        try:
+            for attempt in range(BACKSTOP_RETRY_ATTEMPTS):
+                try:
+                    self._drain_transcript()
+                except Exception as e:
+                    log.debug("turn-end own-turn read failed: %s", e)
+                if self._own_turn_read or getattr(self, "_transcript", None) is None:
+                    break
+                if attempt != BACKSTOP_RETRY_ATTEMPTS - 1:
+                    self._wait_backstop_retry()
+        finally:
+            self._hold_next_turn = False
+
     def _finish_turn(self, *, confirmed: bool = True) -> None:
         """Drop the technical bubble and stop the typing indicator at the real end of a turn."""
         self._n1_pin_owner()
         marker_of_this_end, self._marker_seen = self._marker_seen, None
         self._status_clear()
         was_active = self._turn_active.is_set()
+        if self._n1 is not None and was_active and self._turn_from_tg:
+            self._n1_read_own_turn()                 # shared session: ONE read path; the buffer is taken only after it
         from_tg_at_end = self._turn_from_tg
         text_sent_at_end = self._turn_text_sent
         reaction_at_end = getattr(self, "_turn_is_reaction", False)
@@ -2368,7 +2390,7 @@ class AttachBridge:
         # or interim forwarding missed it), deliver the final assistant message now. The
         # `_turn_text_sent` guard means this only fires when truly nothing was sent (no double-send),
         # and _send_final sets it True so a second _finish_turn won't re-fire.
-        if (was_active and self._turn_from_tg and not self._turn_text_sent
+        if (self._n1 is None and was_active and self._turn_from_tg and not self._turn_text_sent
                 and not getattr(self, "_turn_is_reaction", False)
                 and self._owner_chat is not None
                 and getattr(self, "_turn_end_backstop_enabled", True)):
@@ -2402,6 +2424,14 @@ class AttachBridge:
                           "signal_configured=%s",
                           dur, self._typing_count, getattr(self, "_transcript", None) is not None,
                           getattr(self, "_signal", None) is not None)
+        elif (self._n1 is not None and was_active and self._turn_from_tg and not self._turn_text_sent
+                and not getattr(self, "_turn_is_reaction", False) and self._owner_chat is not None):
+            # Shared session: no second reader. What the own-turn read delivered is all there is; files alone still go out.
+            if getattr(self, "_pending_files", None):
+                self._send_final("")
+            else:
+                log.error("TURN END: Telegram turn ended without an answer (shared session, own turn read to its end: %s)",
+                          self._own_turn_read)
         elif (was_active and self._turn_from_tg and not self._turn_text_sent
                 and self._owner_chat is not None
                 and not getattr(self, "_turn_is_reaction", False)):
@@ -2777,7 +2807,11 @@ class AttachBridge:
                 if n1 is not None and self._hold_next_turn and (
                         not isinstance(rec, dict) or shared.classify(rec) in ("human", "foreign", "notification")):
                     self._tpos = rec_off          # left for the normal drain: it starts the next turn, not this finishing
+                    self._own_turn_read = True    # the next turn's record: everything of the turn being finished was read
                     break
+                if n1 is not None and isinstance(rec, dict) and rec.get("type") == "system" \
+                        and rec.get("subtype") in ("stop_hook_summary", "turn_duration"):
+                    self._own_turn_read = True    # the harness wrote the end of this turn: its answer is before it
                 if n1 is not None:
                     if not isinstance(rec, dict):
                         # A complete line that cannot be read stands for a lost record (maybe a switch to
