@@ -105,6 +105,50 @@ class MarkerToctouTests(RigTestCase):
         self.assertEqual(marker.read_text("utf-8"), newest["text"])
         self.assertEqual(sorted(p.name for p in marker.parent.glob(".turn_end-*")), [])
 
+    def test_a_newer_stop_that_was_taken_is_given_back_to_the_empty_path_and_ends_turn_two(self):
+        r = self.rig
+        self.begin(follow_chat=OWNER)
+        marker = r.bridge._turn_end
+        self.finish_turn_one(lambda: None, during_finishing=r.stop)    # turn 2's Stop is already there; nothing else happens
+        self.assertTrue(marker.exists(), "the claimed newer Stop went back to the path")
+        r.drain()
+        for _ in range(4):
+            r.tick()
+        self.assertEqual(r.sent_to(OWNER).count(FOLLOW_ANSWER), 1)
+        self.assertEqual(r.bridge._route.kind, "none", "turn 2 ended with ITS OWN Stop (idle fallback disabled)")
+        self.assertEqual(sorted(p.name for p in marker.parent.glob(".turn_end-*")), [])
+
+    def test_a_link_failure_other_than_exists_does_not_destroy_the_newer_stop(self):
+        r = self.rig
+        self.begin(follow_chat=OWNER)
+        marker = r.bridge._turn_end
+        with patch("agent2telegram.attach.os.link", side_effect=PermissionError("no hard links")):
+            self.finish_turn_one(lambda: None, during_finishing=r.stop)
+        self.assertTrue(marker.exists(), "moved back without the link")
+        r.drain()
+        for _ in range(4):
+            r.tick()
+        self.assertEqual(r.sent_to(OWNER).count(FOLLOW_ANSWER), 1)
+        self.assertEqual(r.bridge._route.kind, "none")
+        self.assertEqual(sorted(p.name for p in marker.parent.glob(".turn_end-*")), [])
+
+    def test_a_link_failure_with_the_path_taken_keeps_the_newer_stop_in_the_claim_file(self):
+        r = self.rig
+        self.begin(follow_chat=OWNER)
+        marker = r.bridge._turn_end
+
+        real_replace = os.replace
+
+        def failing_replace(src, dst):
+            if str(src).endswith(".turn_end-consume-%d" % os.getpid()):
+                raise PermissionError("cannot move back")
+            return real_replace(src, dst)
+        with patch("agent2telegram.attach.os.link", side_effect=PermissionError("no hard links")), \
+                patch("agent2telegram.attach.os.replace", side_effect=failing_replace):
+            self.finish_turn_one(lambda: None, during_finishing=r.stop)
+        # taking the claim worked; moving it back failed: the only copy is kept, never deleted
+        self.assertEqual([p.name for p in marker.parent.glob(".turn_end-consume-*")], [".turn_end-consume-%d" % os.getpid()])
+
 
 if __name__ == "__main__":
     unittest.main()

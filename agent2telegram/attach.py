@@ -2215,20 +2215,30 @@ class AttachBridge:
         except OSError:
             return
         try:
+            same = claim.read_text("utf-8") == seen
+        except (OSError, ValueError):
+            same = False
+        if not same:
             try:
-                same = claim.read_text("utf-8") == seen
-            except (OSError, ValueError):
-                same = False
-            if not same:
+                os.link(claim, self._turn_end)
+            except FileExistsError:
+                pass                                    # an even newer Stop is already there: it is the one that stays
+            except OSError as exc:
+                # No hard links here (or another failure): the newer Stop must not be destroyed. Move it back if the path is
+                # still free; if that fails too, keep the claim file rather than delete the only copy.
+                log.warning("shared session: could not give the newer Stop marker back with a link (%s)", exc)
                 try:
-                    os.link(claim, self._turn_end)
+                    if not self._turn_end.exists():
+                        os.replace(claim, self._turn_end)
+                        return
                 except OSError:
                     pass
-        finally:
-            try:
-                claim.unlink()
-            except OSError:
-                pass
+                if not self._turn_end.exists():
+                    return                              # kept as .turn_end-consume-<pid>, never read as a marker
+        try:
+            claim.unlink()
+        except OSError:
+            pass
 
     def _last_assistant_text(self) -> str | None:
         """The most recent assistant text in the transcript (the turn's final answer). Read-only
