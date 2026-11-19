@@ -2233,9 +2233,11 @@ class AttachBridge:
                     data = claim.read_bytes()
                     fd = os.open(self._turn_end, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     try:
-                        os.write(fd, data)
+                        written = os.write(fd, data)
                     finally:
                         os.close(fd)
+                    if written != len(data):
+                        return                          # short write: keep the claim, it is the only full copy
                 except FileExistsError:
                     pass
                 except OSError:

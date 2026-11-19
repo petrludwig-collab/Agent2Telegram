@@ -194,6 +194,25 @@ class MarkerToctouTests(RigTestCase):
         self.assertEqual(real_read_text(marker), newest["text"], "C survived, nothing older overwrote it")
         self.assertEqual(sorted(p.name for p in marker.parent.glob(".turn_end-*")), [])
 
+    def test_a_short_write_in_the_fallback_keeps_the_claim_with_the_full_stop(self):
+        r = self.rig
+        self.begin(follow_chat=OWNER)
+        marker = r.bridge._turn_end
+        real_write, full = os.write, {}
+
+        def short_write(fd, data):
+            if bytes(data).startswith(b'{"timestamp"'):
+                full["data"] = bytes(data)
+                return real_write(fd, data[:5])                         # a prefix only, no exception
+            return real_write(fd, data)
+        with patch("agent2telegram.attach.os.link", side_effect=PermissionError("no hard links")), \
+                patch("agent2telegram.attach.os.write", short_write):
+            self.finish_turn_one(lambda: None, during_finishing=r.stop)
+        claim = marker.parent / (".turn_end-consume-%d" % os.getpid())
+        self.assertTrue(full, "the fallback wrote")
+        self.assertTrue(claim.exists(), "the only full copy of the Stop is kept")
+        self.assertEqual(claim.read_bytes(), full["data"])
+
 
 if __name__ == "__main__":
     unittest.main()
