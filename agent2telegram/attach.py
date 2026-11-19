@@ -2401,8 +2401,13 @@ class AttachBridge:
             self._marker_seen = self._turn_end.read_text("utf-8") if has_marker else None
         except OSError:
             self._marker_seen = None
-        if (boundary is not getattr(self, "_turn_input_boundary", None)
-                or (from_hook and not has_marker)
+        if boundary is not getattr(self, "_turn_input_boundary", None):
+            # A new turn began during this evaluation: the marker may be ITS Stop. No ownership decision was made, so nothing
+            # is consumed; the next pass judges it against the now-current turn (uuid rule) and consumes it if stale.
+            log.info("turn end ignored: it does not belong to the current Telegram input")
+            self._marker_seen = None
+            return
+        if ((from_hook and not has_marker)
                 or (has_marker and not self._hook_ends_current_turn())):
             log.info("turn end ignored: it does not belong to the current Telegram input")
             seen, self._marker_seen = self._marker_seen, None

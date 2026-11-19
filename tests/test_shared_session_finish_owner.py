@@ -188,6 +188,44 @@ class TerminalStopConsumedOnceTests(RigTestCase):
         self.assertEqual(calls["finish"], 1)
 
 
+class BoundaryChangedDuringEvaluationTests(RigTestCase):
+    def test_a_short_result_turn_read_by_the_top_drain_of_the_end_keeps_its_own_stop(self):
+        from n1_rig import assistant, notification
+        r = self.rig
+        r.bridge._idle_limit = lambda: 10 ** 9
+        r.tg_turn(OWNER, "start a background task")
+        r.launch("tA")
+        # the whole result turn ran meanwhile: its record, its answer and ITS Stop (the marker names the notification)
+        r.append(notification("tA", "n-1"), assistant("[tg] RESULT of the task", "a-2"))
+        r.stop()
+        r.bridge._end_turn(from_hook=True)                             # its top drain reads the notification (claim)
+        self.assertTrue(r.bridge._turn_end.exists(), "the marker of the new turn is not consumed by the evaluation that saw the change")
+        for _ in range(3):
+            r.tick()
+        self.assertEqual(r.sent_to(OWNER).count("RESULT of the task"), 1)
+        self.assertEqual(r.job("tA"), "delivered")
+        self.assertEqual(r.bridge._route.kind, "none", "the result turn ends with its own Stop, idle is disabled")
+        self.assertFalse(r.bridge._turn_end.exists())
+
+    def test_a_stale_marker_met_after_the_boundary_change_is_consumed_by_the_next_evaluation(self):
+        from n1_rig import notification
+        r = self.rig
+        r.bridge._idle_limit = lambda: 10 ** 9
+        r.tg_turn(OWNER, "start a background task")
+        r.launch("tA")
+        r.stop()                                                       # the Stop of turn 1 ...
+        r.append(notification("tA", "n-1"))                            # ... but the result turn starts before it is evaluated
+        r.bridge._end_turn(from_hook=True)
+        calls = []
+        real = r.bridge._finish_turn
+        r.bridge._finish_turn = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+        r.tick()
+        r.tick()
+        self.assertFalse(r.bridge._turn_end.exists(), "refused by the uuid rule, then consumed as stale")
+        self.assertEqual(calls, [])
+        self.assertEqual(r.bridge._route.kind, "notif", "the stale Stop does not end the new turn")
+
+
 class GroupBufferOwnershipTests(RigTestCase):
     def new_turn(self, chat, text):
         from n1_rig import human
