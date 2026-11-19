@@ -10,7 +10,8 @@ loop, the real send gate and the fake Telegram; idle fallback disabled; no real 
 import time
 import unittest
 
-from n1_rig import GROUP, OWNER, RigTestCase
+from n1_rig import GROUP, OWNER, RigTestCase, assistant, human
+from agent2telegram import attach as attach_mod
 from test_shared_session_s3a import (ANSWER_1, ANSWER_2, DURATION_2, ENQUEUE, FOLLOW_ANSWER, HUMAN_1, THINKING, s3a_records)
 
 
@@ -138,6 +139,63 @@ class SingleReadTests(RigTestCase):
         self.assertIn("Answer one", r.sent_to(GROUP))
         self.assertEqual(r.sent_to(GROUP).count(FOLLOW_ANSWER), 1)
         self.assertEqual(r.bridge._route.kind, "none")
+
+
+class OwnTurnReadEndTests(RigTestCase):
+    """What ends the read of the own turn (evidence), and that it is bounded by the existing retry count."""
+    def finish(self, arrivals):
+        r = self.rig
+        r.bridge._idle_limit = lambda: 10 ** 9
+        calls, waits = [], []
+        real = r.bridge._last_assistant_text
+        r.bridge._last_assistant_text = lambda: (calls.append(1), real())[1]
+
+        def wait():
+            waits.append(1)
+            if len(waits) == 1 and arrivals:
+                r.append(*arrivals)
+        r.bridge._wait_backstop_retry = wait
+        r.stop()
+        r.tick()
+        r.tick()
+        return calls, waits
+
+    def start(self, text="question"):
+        self.rig.tg_turn(OWNER, text)
+
+    def test_nothing_arrives_the_read_is_bounded_by_the_existing_retry_count_and_no_tail_scan_runs(self):
+        self.start()
+        calls, waits = self.finish([])
+        self.assertEqual(len(waits), attach_mod.BACKSTOP_RETRY_ATTEMPTS - 1)
+        self.assertEqual(calls, [], "no second reader in shared mode")
+        self.assertEqual(self.rig.sent_to(OWNER), [])
+        self.assertEqual(self.rig.bridge._route.kind, "none")
+
+    def test_the_turn_summary_ends_the_read(self):
+        self.start()
+        calls, waits = self.finish([assistant("the answer", "a-1"), {"type": "system", "subtype": "turn_duration", "uuid": "s-1"}])
+        self.assertEqual(len(waits), 1, "ended as soon as the own turn's summary was read")
+        self.assertEqual(self.rig.sent_to(OWNER), ["the answer"])
+
+    def test_the_next_turns_record_ends_the_read(self):
+        r = self.rig
+        self.start()
+        self.assertTrue(r.tg(OWNER, "next"))
+        calls, waits = self.finish([assistant("the answer", "a-1"), human(r.typed[-1], "h-2")])
+        self.assertEqual(len(waits), 1, "ended at the boundary of the next turn")
+        self.assertEqual(r.sent_to(OWNER), ["the answer"])
+
+    def test_a_summary_of_an_earlier_turn_is_not_evidence_for_the_next_one(self):
+        r = self.rig
+        self.start("first")
+        r.append(assistant("answer A", "a-0"), {"type": "system", "subtype": "turn_duration", "uuid": "s-0"})
+        r.drain()
+        self.finish([])
+        r.client.sent.clear()
+        self.start("second")
+        calls, waits = self.finish([assistant("answer B", "a-1"), {"type": "system", "subtype": "turn_duration", "uuid": "s-1"}])
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(r.sent_to(OWNER), ["answer B"], "the stale flag did not cut the read of turn 2 short")
 
 
 if __name__ == "__main__":
