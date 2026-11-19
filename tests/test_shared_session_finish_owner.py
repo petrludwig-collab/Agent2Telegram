@@ -77,6 +77,37 @@ class FinishOwnershipTests(RigTestCase):
         self.assertEqual(r.bridge._route.kind, "none", "turn 2 ends with ITS Stop, no idle fallback")
         self.assertIsNone(r.n1.turn())
 
+    def test_the_stop_marker_of_a_short_next_turn_written_during_the_finishing_survives_and_ends_that_turn(self):
+        r = self.rig
+        self.begin()
+        r.stop()                                                       # the marker of turn 1
+        arrived = []
+        real_wait = r.bridge._wait_backstop_retry
+
+        def turn_two_runs_and_stops_meanwhile():
+            if not arrived:
+                arrived.append(1)
+                self.feed(ANSWER_1, DURATION_2)                        # turn 2 is short: its answer is already there ...
+                r.stop()                                               # ... and its Stop marker (naming the queued record)
+            real_wait()
+        r.bridge._wait_backstop_retry = turn_two_runs_and_stops_meanwhile
+        r.tick()
+        r.bridge._wait_backstop_retry = real_wait
+        self.assertTrue(r.bridge._turn_end.exists(), "finishing turn 1 must not delete the marker of turn 2")
+        r.tick()
+        r.tick()
+        self.assertEqual(r.bridge._route.kind, "none", "turn 2 ends with ITS OWN marker, not by idle")
+        self.assertEqual(r.sent_to(OWNER).count(FOLLOW_ANSWER), 1)
+        self.assertEqual(len([x for x in r.sent_to(OWNER) if x.startswith("1 SAMEA")]), 1)
+        self.assertFalse(r.bridge._turn_end.exists(), "and the evaluated marker is consumed")
+
+    def test_a_new_inbound_message_never_drops_a_stop_marker_in_shared_session_mode(self):
+        r = self.rig
+        r.stop()                                                       # a marker is on disk (e.g. of a running turn)
+        self.assertTrue(r.bridge._turn_end.exists())
+        self.assertTrue(r.tg(OWNER, "a new message"))                  # _begin_turn runs
+        self.assertTrue(r.bridge._turn_end.exists(), "the marker is dropped only by the evaluation that read it")
+
     def test_answer_two_read_in_the_same_inner_drain_is_covered_too(self):
         r = self.rig
         self.begin()
@@ -113,6 +144,43 @@ class FinishOwnershipTests(RigTestCase):
         self.assertEqual(r.sent_to(GROUP).count(FOLLOW_ANSWER), 1)
         self.assertEqual(r.sent_to(OWNER).count(FOLLOW_ANSWER), 0, "answer 2 never to the old recipient")
         self.assertEqual(r.bridge._route.kind, "none")
+
+
+class GroupBufferOwnershipTests(RigTestCase):
+    def new_turn(self, chat, text):
+        from n1_rig import human
+        r = self.rig
+        self.assertTrue(r.tg(chat, text))
+        r.append(human(r.typed[-1], r.next_uuid("h2")))                # the harness runs it as its own (queued) turn
+        r.drain()
+
+    def test_a_buffered_group_final_goes_to_its_own_group_when_another_chats_turn_starts(self):
+        r = self.rig
+        r.bridge._idle_limit = lambda: 10 ** 9
+        r.tg_turn(GROUP, "group question")
+        r.say("[tg] the group's final answer")
+        self.assertIsNotNone(r.bridge._group_reply, "withheld until the turn end (group_interim off)")
+        self.new_turn(OWNER, "a DM follow-up")                         # the boundary of turn 2 is read BEFORE turn 1's Stop
+        r.tick()
+        self.assertEqual(r.sent_to(GROUP), ["the group's final answer"], "delivered to ITS chat at the boundary")
+        self.assertEqual(r.sent_to(OWNER), [])
+        r.stop()                                                       # the Stop of turn 2
+        r.tick()
+        r.tick()
+        self.assertEqual(r.sent_to(OWNER), [], "the old final text never reaches the new recipient")
+        self.assertEqual(r.sent_to(GROUP), ["the group's final answer"], "and is not sent twice")
+
+    def test_same_group_two_turns_each_final_answer_is_sent_once(self):
+        r = self.rig
+        r.bridge._idle_limit = lambda: 10 ** 9
+        r.tg_turn(GROUP, "first")
+        r.say("[tg] answer one")
+        self.new_turn(GROUP, "second")
+        r.say("[tg] answer two")
+        r.stop()
+        r.tick()
+        r.tick()
+        self.assertEqual(r.sent_to(GROUP), ["answer one", "answer two"])
 
 
 class FinishOwnershipForResultRoutesTests(RigTestCase):

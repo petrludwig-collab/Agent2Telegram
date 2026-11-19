@@ -272,6 +272,7 @@ class AttachBridge:
     _n1_gate = None             # RLock: route changes of the transcript thread and the inbound thread
     _n1_last_rec = 0.0          # monotonic ts of the last transcript content (last-resort idle fallback)
     _hold_next_turn = False     # while a turn is being finished, the drain stops before the record that starts the NEXT turn
+    _marker_seen = None         # the content of the Stop marker the current evaluation read: the only one this turn end may consume
     _route = None               # shared_session.Route: THE routing state of the running turn (ON only)
 
     def __init__(self, cfg: Config, *, client: TelegramClient | None = None) -> None:
@@ -1610,7 +1611,8 @@ class AttachBridge:
 
     def _begin_turn(self) -> None:
         # Light "typing…" from the actual injection point.
-        self._consume_turn_end()                 # drop any stale end-marker from a prior turn
+        if self._n1 is None:
+            self._consume_turn_end()             # drop any stale end-marker from a prior turn
         path = getattr(self, "_transcript", None)
         try:
             size = path.stat().st_size if path is not None else 0
@@ -1886,11 +1888,13 @@ class AttachBridge:
         kind = turn["kind"] if turn else None
         r = self._route
         if out.claim:                                   # the harness started processing a bound completion
+            self._n1_hand_over(r, "notif", None, out.claim["task"])
             self._n1_enter("notif", out.claim["chat"], job=out.claim["task"])
             self._begin_turn()
             return
         if kind in ("tg", "notif"):
             if out.changed or r.kind != kind or r.cut != bool(turn.get("cut")):
+                self._n1_hand_over(r, kind, turn.get("nonce"), turn.get("job"))
                 self._n1_enter(kind, turn["chat"], job=turn.get("job"), nonce=turn.get("nonce"),
                                cut=bool(turn.get("cut")))
             for chat in out.cut_chats:
@@ -1902,6 +1906,24 @@ class AttachBridge:
                 self._route = shared.Route("other")
         elif r.kind in ("tg", "notif", "other"):
             self._n1_exit("no turn")
+
+    def _n1_hand_over(self, old, kind, nonce, job) -> None:
+        """A new turn starts while the previous Telegram/result route is still the current one (no Stop was seen yet): the
+        previous answer is final now, so what it still buffers (a group's final text / files, withheld until the turn end)
+        goes to ITS recipient at this boundary (the gate re-checks authorisation and the cut), never to the new one, and
+        never twice. The new turn starts with clean per-turn flags."""
+        if old.kind not in ("tg", "notif") or (old.kind, old.nonce, old.job) == (kind, nonce, job):
+            return                                      # nothing before it, or the same turn (e.g. only a cut changed)
+        reply, self._group_reply = self._group_reply, None
+        files, self._group_files = tuple(self._group_files or ()), ()
+        if self._turn_from_tg and self._n1_forward_ok(old.chat) and (reply is not None or files):
+            if files:
+                self._pending_files = list(getattr(self, "_pending_files", []) or []) + list(files)
+            self._owner_chat = old.chat
+            self._send_final(reply[0] if reply is not None else "", key=reply[1] if reply is not None else None)
+        elif reply is not None or files:
+            self._n1_dropped("buffered group reply of the previous turn")
+        self._turn_text_sent = False
 
     def _n1_service_line(self, chat, text) -> None:
         """One fixed line to a chat whose answer was stopped. Best effort: a failure is logged explicitly (the
@@ -2171,8 +2193,17 @@ class AttachBridge:
                         log.debug("tui scrape: %s", e)
             self._stop.wait(1.0)
 
-    def _consume_turn_end(self) -> None:
+    def _consume_turn_end(self, seen: str | None = None) -> None:
         if self._turn_end is not None:
+            if self._n1 is not None:
+                # Shared session: only the marker that was EVALUATED (and belonged to the turn being ended or ignored) goes.
+                # A newer marker (the Stop of a short next turn written while this one was being finished) survives and is
+                # processed for its own turn.
+                try:
+                    if seen is None or self._turn_end.read_text("utf-8") != seen:
+                        return
+                except OSError:
+                    return
             try:
                 self._turn_end.unlink()
             except OSError:
@@ -2278,6 +2309,7 @@ class AttachBridge:
     def _finish_turn(self, *, confirmed: bool = True) -> None:
         """Drop the technical bubble and stop the typing indicator at the real end of a turn."""
         self._n1_pin_owner()
+        marker_of_this_end, self._marker_seen = self._marker_seen, None
         self._status_clear()
         was_active = self._turn_active.is_set()
         from_tg_at_end = self._turn_from_tg
@@ -2349,7 +2381,7 @@ class AttachBridge:
         self._turn_active.clear()
         self._group_end_confirmed = False
         self._pending_turn_end = False
-        self._consume_turn_end()
+        self._consume_turn_end(marker_of_this_end)
         if was_active:
             # from_tg/text_sent are in the line on purpose: when a reply goes missing, these two
             # flags decide whether anything was even attempted, and reconstructing them
@@ -2365,13 +2397,14 @@ class AttachBridge:
     def _end_turn(self, *, confirmed: bool = True, from_hook: bool = False) -> None:
         # Claude Stop-hook path: catch anything written just before the hook fired, then finish.
         boundary = getattr(self, "_turn_input_boundary", None)
+        self._marker_seen = None
         self._drain_transcript()
         has_marker = self._turn_end is not None and self._turn_end.exists()
         if (boundary is not getattr(self, "_turn_input_boundary", None)
                 or (from_hook and not has_marker)
                 or (has_marker and not self._hook_ends_current_turn())):
             log.info("turn end ignored: it does not belong to the current Telegram input")
-            self._consume_turn_end()
+            self._consume_turn_end(self._marker_seen)
             return
         if confirmed:
             self._finish_turn()
@@ -2416,6 +2449,7 @@ class AttachBridge:
             return True
         try:
             content = self._turn_end.read_text("utf-8")
+            self._marker_seen = content
             try:
                 marker = json.loads(content)
             except ValueError:
