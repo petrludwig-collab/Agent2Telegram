@@ -401,8 +401,11 @@ gets a fixed error; every injection is a single attempt; the terminal is never a
 prompt may wait in Claude's own queue as long as it needs, bounded by `"shared_session_job_ttl"` (default 86400), which
 also limits how long a bound task stays deliverable. State lives in one file next to the signal file (`shared_session_<tmux>.json`).
 This is an operational correlation, not a security boundary: anyone who can already read or write the
-same account, tmux, transcript or state file can forge the envelope or the state. It is also checked
-only against synthetic transcripts, not against a live Claude Code session.
+same account, tmux, transcript or state file can forge the envelope or the state. Besides the synthetic-transcript
+tests it was checked in one isolated live trial (Claude Code 2.1.328, local Telegram stand-in), not on other versions.
+Known limits: when a turn ends, the bridge reads the rest of that turn for a short bounded window (about 1.4 s); an
+answer that Claude writes to the transcript later than that is not forwarded (logged as "ended without an answer"), but
+text of another turn is never sent in its place. A restart in the middle of a turn ends its route as `uncertain`.
 
 ---
 

@@ -9,7 +9,7 @@
   that the harness starts processing starts a result route for the bound job's own chat; `delivered` only after a
   confirmed send, otherwise `uncertain` (never retried). A message of another chat queued inside a running answer stops
   forwarding of that answer (fixed line to both chats) instead of taking it over. Operational correlation only, not
-  protection against someone with the same account; not verified against a live Claude Code.
+  protection against someone with the same account; checked in one isolated live trial (Claude Code 2.1.328).
 - Attach mode defaults to `group_interim: false`: group destinations receive the final
   answer and allowed attachments, with narration, tool/status bubbles, background progress,
   typing and queued-message acknowledgments suppressed. Private-chat progress is unchanged;
