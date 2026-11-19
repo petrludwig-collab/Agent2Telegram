@@ -212,20 +212,21 @@ class OwnTurnReadEndTests(RigTestCase):
         self.assertEqual(len(waits), attach_mod.BACKSTOP_RETRY_ATTEMPTS - 1, "a summary not chained to this route's output is no evidence")
         self.assertEqual(self.rig.sent_to(OWNER), ["the answer"])
 
-    def test_a_turn_duration_that_hangs_on_no_accepted_summary_does_not_end_the_read(self):
-        self.start()
-        calls, waits = self.finish([assistant("the answer", "a-1"),
-                                    {"type": "system", "subtype": "turn_duration", "uuid": "d-9", "parentUuid": "a-1"}])
-        self.assertEqual(len(waits), attach_mod.BACKSTOP_RETRY_ATTEMPTS - 1)
-        self.assertEqual(self.rig.sent_to(OWNER), ["the answer"])
-
-    def test_a_turn_duration_hanging_on_the_accepted_summary_ends_the_read(self):
-        self.start()
-        calls, waits = self.finish([assistant("the answer", "a-1"),
-                                    {"type": "system", "subtype": "stop_hook_summary", "uuid": "s-1", "parentUuid": "a-1"},
-                                    {"type": "system", "subtype": "turn_duration", "uuid": "d-1", "parentUuid": "s-1"}])
-        self.assertEqual(len(waits), 1)
-        self.assertEqual(self.rig.sent_to(OWNER), ["the answer"])
+    def test_a_malformed_parent_uuid_is_no_evidence_and_never_loses_the_answer_in_the_same_chunk(self):
+        for bad in ([], {}, 7, None):
+            with self.subTest(parent=bad):
+                r = self.rig
+                r.client.sent.clear()
+                self.start(f"question {bad!r}")
+                answer = assistant("the answer", f"a-{id(bad)}")
+                answer["parentUuid"] = bad
+                summary = {"type": "system", "subtype": "stop_hook_summary", "uuid": f"s-{id(bad)}", "parentUuid": bad}
+                weird = {"type": "attachment", "uuid": ["not", "a", "str"], "parentUuid": {}}
+                duration = {"type": "system", "subtype": "turn_duration", "uuid": f"d-{id(bad)}", "parentUuid": bad}
+                calls, waits = self.finish([weird, summary, duration, answer])       # one chunk: the answer follows the malformed records
+                self.assertEqual(r.sent_to(OWNER), ["the answer"], "delivered fully, exactly once")
+                self.assertEqual(len(waits), attach_mod.BACKSTOP_RETRY_ATTEMPTS - 1, "no evidence: the bounded retry ran")
+                self.assertEqual(r.bridge._route.kind, "none")
 
     def test_a_summary_written_before_the_own_answer_does_not_end_the_read_and_the_answer_is_delivered_once(self):
         self.start()
@@ -259,7 +260,7 @@ class OwnTurnReadEndTests(RigTestCase):
         os.replace(replacement, r.transcript)
         r.drain()
         self.assertEqual(r.bridge._route.kind, "none")
-        self.assertEqual((r.bridge._own_turn_read, r.bridge._own_tip, r.bridge._own_summaries), (False, None, set()))
+        self.assertEqual((r.bridge._own_turn_read, r.bridge._own_tip), (False, None))
 
     def test_a_group_turn_with_only_files_delivers_them_once_to_its_chat(self):
         r = self.rig

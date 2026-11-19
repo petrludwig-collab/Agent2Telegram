@@ -274,7 +274,6 @@ class AttachBridge:
     _hold_next_turn = False     # while a turn is being finished, the drain stops before the record that starts the NEXT turn
     _own_turn_read = False      # shared session: evidence that the turn being finished was read to its end (its summary chain / the next boundary)
     _own_tip = None             # uuid of the last output record read since the current route opened (the record a summary must hang on)
-    _own_summaries = None       # uuids of the accepted stop_hook_summary records (a turn_duration must hang on one)
     _marker_seen = None         # the content of the Stop marker the current evaluation read: the only one this turn end may consume
     _route = None               # shared_session.Route: THE routing state of the running turn (ON only)
 
@@ -2351,27 +2350,22 @@ class AttachBridge:
 
     def _n1_forget_evidence(self) -> None:
         self._own_turn_read = False
-        self._own_tip, self._own_summaries = None, set()
+        self._own_tip = None
 
     def _n1_note_chain(self, rec) -> None:
         """Evidence that the turn of the CURRENT route was read to its end: Claude chains its records by ``parentUuid``
-        (prompt <- assistant/attachment ... <- stop_hook_summary <- turn_duration). A summary counts only if it hangs on the
-        last output record (assistant / attachment / tool result) read since this route opened, so it provably follows everything
-        read of this turn; a turn_duration only if it hangs on such a summary. Anything else proves nothing (the read then simply
-        runs its bounded retry)."""
+        (prompt <- assistant/attachment ... <- stop_hook_summary). A summary counts only if its parentUuid is the last output
+        record (assistant / attachment / tool result) read since this route opened, so it provably follows everything read of
+        this turn. Anything else proves nothing (the read then simply runs its bounded retry). Never raises: a malformed
+        uuid / parentUuid is no evidence."""
         if not isinstance(rec, dict) or self._route.kind not in ("tg", "notif"):
             return
-        if self._own_summaries is None:
-            self._n1_forget_evidence()
-        uid, parent, sub, kind = rec.get("uuid"), rec.get("parentUuid"), rec.get("subtype"), rec.get("type")
-        if kind == "system":
-            if sub == "stop_hook_summary" and self._own_tip is not None and parent == self._own_tip:
-                if isinstance(uid, str):
-                    self._own_summaries.add(uid)
+        uid, parent = rec.get("uuid"), rec.get("parentUuid")
+        if rec.get("type") == "system":
+            if (rec.get("subtype") == "stop_hook_summary" and isinstance(parent, str)
+                    and self._own_tip is not None and parent == self._own_tip):
                 self._own_turn_read = True
-            elif sub == "turn_duration" and parent in self._own_summaries:
-                self._own_turn_read = True
-        elif isinstance(uid, str) and (kind in ("assistant", "attachment") or shared.classify(rec) == "tool_result"):
+        elif isinstance(uid, str) and (rec.get("type") in ("assistant", "attachment") or shared.classify(rec) == "tool_result"):
             self._own_tip = uid
 
     def _n1_read_own_turn(self) -> None:
