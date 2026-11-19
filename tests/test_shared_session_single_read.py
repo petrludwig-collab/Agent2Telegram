@@ -229,6 +229,15 @@ class OwnTurnReadEndTests(RigTestCase):
                 self.assertEqual(len(waits), attach_mod.BACKSTOP_RETRY_ATTEMPTS - 1, "no evidence: the bounded retry ran")
                 self.assertEqual(r.bridge._route.kind, "none")
 
+    def test_an_output_record_without_a_usable_uuid_makes_the_next_summary_no_evidence(self):
+        self.start()
+        calls, waits = self.finish([assistant("first part", "a"), {"type": "attachment", "uuid": [], "parentUuid": "a"},
+                                    {"type": "system", "subtype": "stop_hook_summary", "uuid": "s-1", "parentUuid": "a"}],
+                                   third=[assistant("the rest of the answer", "a-2"),
+                                          {"type": "system", "subtype": "stop_hook_summary", "uuid": "s-2", "parentUuid": "a-2"}])
+        self.assertEqual(len(waits), 3, "the summary hung on 'a', not on the last output read: no evidence, read on")
+        self.assertEqual(self.rig.sent_to(OWNER), ["first part", "the rest of the answer"], "delivered fully, once each")
+
     def test_a_summary_written_before_the_own_answer_does_not_end_the_read_and_the_answer_is_delivered_once(self):
         self.start()
         early = {"type": "system", "subtype": "stop_hook_summary", "uuid": "s-early", "parentUuid": self.prompt_uuid()}

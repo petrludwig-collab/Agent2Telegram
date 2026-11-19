@@ -2365,8 +2365,8 @@ class AttachBridge:
             if (rec.get("subtype") == "stop_hook_summary" and isinstance(parent, str)
                     and self._own_tip is not None and parent == self._own_tip):
                 self._own_turn_read = True
-        elif isinstance(uid, str) and (rec.get("type") in ("assistant", "attachment") or shared.classify(rec) == "tool_result"):
-            self._own_tip = uid
+        elif rec.get("type") in ("assistant", "attachment") or shared.classify(rec) == "tool_result":
+            self._own_tip = uid if isinstance(uid, str) else None      # an unidentifiable last output = no evidence
 
     def _n1_read_own_turn(self) -> None:
         """Shared session: finishing turn N reads the rest of turn N with the live reader (stopping before the record that starts
