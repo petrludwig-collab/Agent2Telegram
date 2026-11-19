@@ -1611,8 +1611,7 @@ class AttachBridge:
 
     def _begin_turn(self) -> None:
         # Light "typing…" from the actual injection point.
-        if self._n1 is None:
-            self._consume_turn_end()             # drop any stale end-marker from a prior turn
+        self._consume_turn_end()                 # drop any stale end-marker from a prior turn (shared session: no-op, only an evaluation consumes)
         path = getattr(self, "_transcript", None)
         try:
             size = path.stat().st_size if path is not None else 0
@@ -1914,15 +1913,14 @@ class AttachBridge:
         never twice. The new turn starts with clean per-turn flags."""
         if old.kind not in ("tg", "notif") or (old.kind, old.nonce, old.job) == (kind, nonce, job):
             return                                      # nothing before it, or the same turn (e.g. only a cut changed)
+        self._turn_tpos = getattr(self, "_n1_rec_off", self._turn_tpos)   # the new turn's backstop must not read the old turn's text
         reply, self._group_reply = self._group_reply, None
         files, self._group_files = tuple(self._group_files or ()), ()
-        if self._turn_from_tg and self._n1_forward_ok(old.chat) and (reply is not None or files):
+        if self._turn_from_tg and (reply is not None or files):
             if files:
                 self._pending_files = list(getattr(self, "_pending_files", []) or []) + list(files)
-            self._owner_chat = old.chat
+            # the route is still the old one here: the single send gate re-checks authorisation and the cut for ITS chat
             self._send_final(reply[0] if reply is not None else "", key=reply[1] if reply is not None else None)
-        elif reply is not None or files:
-            self._n1_dropped("buffered group reply of the previous turn")
         self._turn_text_sent = False
 
     def _n1_service_line(self, chat, text) -> None:
@@ -2739,6 +2737,7 @@ class AttachBridge:
                         log.warning("shared session: unreadable transcript line -> origin closed")
                         rec = shared.UNREADABLE_RECORD
                     with self._n1_gate:
+                        self._n1_rec_off = rec_off
                         self._n1_apply(n1.on_record(rec_off, off, rec))
                     if rec is shared.UNREADABLE_RECORD:
                         continue

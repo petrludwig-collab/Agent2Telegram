@@ -101,7 +101,7 @@ class FinishOwnershipTests(RigTestCase):
         self.assertEqual(len([x for x in r.sent_to(OWNER) if x.startswith("1 SAMEA")]), 1)
         self.assertFalse(r.bridge._turn_end.exists(), "and the evaluated marker is consumed")
 
-    def test_a_new_inbound_message_never_drops_a_stop_marker_in_shared_session_mode(self):
+    def test_a_new_inbound_message_does_not_drop_a_stop_marker_in_shared_session_mode(self):
         r = self.rig
         r.stop()                                                       # a marker is on disk (e.g. of a running turn)
         self.assertTrue(r.bridge._turn_end.exists())
@@ -169,6 +169,20 @@ class GroupBufferOwnershipTests(RigTestCase):
         r.tick()
         self.assertEqual(r.sent_to(OWNER), [], "the old final text never reaches the new recipient")
         self.assertEqual(r.sent_to(GROUP), ["the group's final answer"], "and is not sent twice")
+
+    def test_a_revoked_group_gets_nothing_and_the_new_recipient_does_not_get_it_either(self):
+        r = self.rig
+        r.bridge._idle_limit = lambda: 10 ** 9
+        r.tg_turn(GROUP, "group question")
+        r.say("[tg] the group's final answer")
+        r.bridge.cfg.allowed_group_ids = []                            # the group is no longer authorised
+        self.new_turn(OWNER, "a DM follow-up")
+        r.tick()
+        r.stop()
+        r.tick()
+        r.tick()
+        self.assertEqual(r.sent_to(GROUP), [])
+        self.assertEqual(r.sent_to(OWNER), [])
 
     def test_same_group_two_turns_each_final_answer_is_sent_once(self):
         r = self.rig
