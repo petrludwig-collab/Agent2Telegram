@@ -272,7 +272,9 @@ class AttachBridge:
     _n1_gate = None             # RLock: route changes of the transcript thread and the inbound thread
     _n1_last_rec = 0.0          # monotonic ts of the last transcript content (last-resort idle fallback)
     _hold_next_turn = False     # while a turn is being finished, the drain stops before the record that starts the NEXT turn
-    _own_turn_read = False      # shared session: evidence that the turn being finished was read to its end (its summary / the next boundary)
+    _own_turn_read = False      # shared session: evidence that the turn being finished was read to its end (its summary chain / the next boundary)
+    _own_tip = None             # uuid of the last output record read since the current route opened (the record a summary must hang on)
+    _own_summaries = None       # uuids of the accepted stop_hook_summary records (a turn_duration must hang on one)
     _marker_seen = None         # the content of the Stop marker the current evaluation read: the only one this turn end may consume
     _route = None               # shared_session.Route: THE routing state of the running turn (ON only)
 
@@ -1796,7 +1798,7 @@ class AttachBridge:
         if kind == "notif" and prev is None and r.kind != "notif":
             prev = self._owner_chat                     # a result route only borrows the owner chat
         self._route = shared.Route(kind, chat, job, nonce, cut, prev)
-        self._own_turn_read = False
+        self._n1_forget_evidence()
         if kind in ("notif", "tg"):
             self._owner_chat = chat
             self._turn_active.set()
@@ -1806,6 +1808,7 @@ class AttachBridge:
         """The only way a routing state ends."""
         r = self._route
         self._route = shared.Route()
+        self._n1_forget_evidence()
         if r.prev_owner is not None:
             self._owner_chat = r.prev_owner
         if r.kind != "none":
@@ -2346,6 +2349,31 @@ class AttachBridge:
         return (getattr(self, "_transcript", None) is not None
                 or getattr(self, "_signal", None) is not None)
 
+    def _n1_forget_evidence(self) -> None:
+        self._own_turn_read = False
+        self._own_tip, self._own_summaries = None, set()
+
+    def _n1_note_chain(self, rec) -> None:
+        """Evidence that the turn of the CURRENT route was read to its end: Claude chains its records by ``parentUuid``
+        (prompt <- assistant/attachment ... <- stop_hook_summary <- turn_duration). A summary counts only if it hangs on the
+        last output record (assistant / attachment / tool result) read since this route opened, so it provably follows everything
+        read of this turn; a turn_duration only if it hangs on such a summary. Anything else proves nothing (the read then simply
+        runs its bounded retry)."""
+        if not isinstance(rec, dict) or self._route.kind not in ("tg", "notif"):
+            return
+        if self._own_summaries is None:
+            self._n1_forget_evidence()
+        uid, parent, sub, kind = rec.get("uuid"), rec.get("parentUuid"), rec.get("subtype"), rec.get("type")
+        if kind == "system":
+            if sub == "stop_hook_summary" and self._own_tip is not None and parent == self._own_tip:
+                if isinstance(uid, str):
+                    self._own_summaries.add(uid)
+                self._own_turn_read = True
+            elif sub == "turn_duration" and parent in self._own_summaries:
+                self._own_turn_read = True
+        elif isinstance(uid, str) and (kind in ("assistant", "attachment") or shared.classify(rec) == "tool_result"):
+            self._own_tip = uid
+
     def _n1_read_own_turn(self) -> None:
         """Shared session: finishing turn N reads the rest of turn N with the live reader (stopping before the record that starts
         turn N+1), up to BACKSTOP_RETRY_ATTEMPTS times with the existing delay. It ends as soon as the own turn was read to its end
@@ -2809,9 +2837,6 @@ class AttachBridge:
                     self._tpos = rec_off          # left for the normal drain: it starts the next turn, not this finishing
                     self._own_turn_read = True    # the next turn's record: everything of the turn being finished was read
                     break
-                if n1 is not None and isinstance(rec, dict) and rec.get("type") == "system" \
-                        and rec.get("subtype") in ("stop_hook_summary", "turn_duration"):
-                    self._own_turn_read = True    # the harness wrote the end of this turn: its answer is before it
                 if n1 is not None:
                     if not isinstance(rec, dict):
                         # A complete line that cannot be read stands for a lost record (maybe a switch to
@@ -2823,6 +2848,7 @@ class AttachBridge:
                         self._n1_apply(n1.on_record(rec_off, off, rec))
                     if rec is shared.UNREADABLE_RECORD:
                         continue
+                    self._n1_note_chain(rec)
                 self._rec_live = self._record_is_live(rec_off, rec)
                 # Prompt identity is independent of reader delivery dedup: the user can
                 # legitimately repeat the same question in a later turn.

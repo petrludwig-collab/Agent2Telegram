@@ -7,6 +7,8 @@ R2: exactly pilot 4: when turn 1's Stop is evaluated the file ends at `enqueue`;
 Both for a DM and for a group (group_interim off: the final text is buffered until the Stop), with the real Stop hook, the real outer
 loop, the real send gate and the fake Telegram; idle fallback disabled; no real time (the wait is replaced, never slept).
 """
+import json
+import os
 import time
 import unittest
 
@@ -143,7 +145,7 @@ class SingleReadTests(RigTestCase):
 
 class OwnTurnReadEndTests(RigTestCase):
     """What ends the read of the own turn (evidence), and that it is bounded by the existing retry count."""
-    def finish(self, arrivals):
+    def finish(self, arrivals, third=None):
         r = self.rig
         r.bridge._idle_limit = lambda: 10 ** 9
         calls, waits = [], []
@@ -154,6 +156,8 @@ class OwnTurnReadEndTests(RigTestCase):
             waits.append(1)
             if len(waits) == 1 and arrivals:
                 r.append(*arrivals)
+            if len(waits) == 3 and third:
+                r.append(*third)
         r.bridge._wait_backstop_retry = wait
         r.stop()
         r.tick()
@@ -173,7 +177,7 @@ class OwnTurnReadEndTests(RigTestCase):
 
     def test_the_turn_summary_ends_the_read(self):
         self.start()
-        calls, waits = self.finish([assistant("the answer", "a-1"), {"type": "system", "subtype": "turn_duration", "uuid": "s-1"}])
+        calls, waits = self.finish([assistant("the answer", "a-1"), {"type": "system", "subtype": "stop_hook_summary", "uuid": "s-1", "parentUuid": "a-1"}])
         self.assertEqual(len(waits), 1, "ended as soon as the own turn's summary was read")
         self.assertEqual(self.rig.sent_to(OWNER), ["the answer"])
 
@@ -188,14 +192,107 @@ class OwnTurnReadEndTests(RigTestCase):
     def test_a_summary_of_an_earlier_turn_is_not_evidence_for_the_next_one(self):
         r = self.rig
         self.start("first")
-        r.append(assistant("answer A", "a-0"), {"type": "system", "subtype": "turn_duration", "uuid": "s-0"})
+        r.append(assistant("answer A", "a-0"), {"type": "system", "subtype": "stop_hook_summary", "uuid": "s-0", "parentUuid": "a-0"})
         r.drain()
         self.finish([])
         r.client.sent.clear()
         self.start("second")
-        calls, waits = self.finish([assistant("answer B", "a-1"), {"type": "system", "subtype": "turn_duration", "uuid": "s-1"}])
+        calls, waits = self.finish([assistant("answer B", "a-1"), {"type": "system", "subtype": "stop_hook_summary", "uuid": "s-1", "parentUuid": "a-1"}])
         self.assertEqual(len(waits), 1)
         self.assertEqual(r.sent_to(OWNER), ["answer B"], "the stale flag did not cut the read of turn 2 short")
+
+    def prompt_uuid(self):
+        lines = [json.loads(x) for x in self.rig.transcript.read_text("utf-8").splitlines()]
+        return [x for x in lines if x.get("type") == "user"][-1]["uuid"]
+
+    def test_a_summary_that_hangs_on_a_foreign_record_does_not_end_the_read(self):
+        self.start()
+        calls, waits = self.finish([assistant("the answer", "a-1"),
+                                    {"type": "system", "subtype": "stop_hook_summary", "uuid": "s-9", "parentUuid": "an-earlier-turn"}])
+        self.assertEqual(len(waits), attach_mod.BACKSTOP_RETRY_ATTEMPTS - 1, "a summary not chained to this route's output is no evidence")
+        self.assertEqual(self.rig.sent_to(OWNER), ["the answer"])
+
+    def test_a_turn_duration_that_hangs_on_no_accepted_summary_does_not_end_the_read(self):
+        self.start()
+        calls, waits = self.finish([assistant("the answer", "a-1"),
+                                    {"type": "system", "subtype": "turn_duration", "uuid": "d-9", "parentUuid": "a-1"}])
+        self.assertEqual(len(waits), attach_mod.BACKSTOP_RETRY_ATTEMPTS - 1)
+        self.assertEqual(self.rig.sent_to(OWNER), ["the answer"])
+
+    def test_a_turn_duration_hanging_on_the_accepted_summary_ends_the_read(self):
+        self.start()
+        calls, waits = self.finish([assistant("the answer", "a-1"),
+                                    {"type": "system", "subtype": "stop_hook_summary", "uuid": "s-1", "parentUuid": "a-1"},
+                                    {"type": "system", "subtype": "turn_duration", "uuid": "d-1", "parentUuid": "s-1"}])
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(self.rig.sent_to(OWNER), ["the answer"])
+
+    def test_a_summary_written_before_the_own_answer_does_not_end_the_read_and_the_answer_is_delivered_once(self):
+        self.start()
+        early = {"type": "system", "subtype": "stop_hook_summary", "uuid": "s-early", "parentUuid": self.prompt_uuid()}
+        calls, waits = self.finish([early], third=[assistant("the full answer", "a-1"),
+                                                   {"type": "system", "subtype": "stop_hook_summary", "uuid": "s-1", "parentUuid": "a-1"}])
+        self.assertEqual(len(waits), 3, "read on until the answer's own summary")
+        self.assertEqual(self.rig.sent_to(OWNER), ["the full answer"])
+
+    def test_a_transcript_reset_clears_the_evidence(self):
+        r = self.rig
+        self.start()
+        r.append(assistant("the answer", "a-1"), {"type": "system", "subtype": "stop_hook_summary", "uuid": "s-1", "parentUuid": "a-1"})
+        r.drain()
+        self.assertTrue(r.bridge._own_turn_read)
+        replacement = r.tmp / "new.jsonl"
+        replacement.write_text(json.dumps(human("another session", "z0")) + "\n")
+        os.replace(replacement, r.transcript)
+        r.drain()
+        self.assertEqual(r.bridge._route.kind, "none")
+        self.assertEqual((r.bridge._own_turn_read, r.bridge._own_tip, r.bridge._own_summaries), (False, None, set()))
+
+    def test_a_group_turn_with_only_files_delivers_them_once_to_its_chat(self):
+        r = self.rig
+        outbox_dir = r.bridge.cfg.path_outbox()
+        outbox_dir.mkdir(parents=True, exist_ok=True)
+        report = outbox_dir / "chart.txt"
+        report.write_text("synthetic attachment")
+        files = []
+        r.client.send_file = lambda chat, path, *a, **k: files.append((chat, str(path)))
+        r.tg_turn(GROUP, "send me the chart")
+        calls, waits = self.finish([assistant(f"[tg] [tg-file] {report}", "a-1"),
+                                    {"type": "system", "subtype": "stop_hook_summary", "uuid": "s-1", "parentUuid": "a-1"}])
+        self.assertEqual([c for c, _ in files], [GROUP], "files only, no text: delivered once, to its chat")
+        self.assertEqual(r.sent_to(GROUP), [])
+        self.assertEqual(r.bridge._route.kind, "none")
+
+    def test_an_unreadable_complete_line_under_hold_ends_the_read_and_is_left_for_the_normal_drain(self):
+        r = self.rig
+        self.start()
+        line_start = r.transcript.stat().st_size
+        seen = []
+        real_finish = r.bridge._finish_turn
+
+        def finish(*a, **k):
+            seen.append(r.bridge._tpos)
+            return real_finish(*a, **k)
+        r.bridge._finish_turn = finish
+
+        def garbage():
+            with r.transcript.open("a", encoding="utf-8") as f:
+                f.write("this is not json\n")
+        r.bridge._idle_limit = lambda: 10 ** 9
+        waits = []
+        r.bridge._wait_backstop_retry = lambda: (waits.append(1), garbage() if len(waits) == 1 else None)
+        real_read = r.bridge._n1_read_own_turn
+
+        def read_and_look():
+            real_read()
+            seen.append(r.bridge._tpos)
+        r.bridge._n1_read_own_turn = read_and_look
+        r.stop()
+        r.tick()
+        self.assertEqual(len(waits), 1, "the unreadable line is a boundary: the read ends")
+        self.assertEqual(seen[-1], line_start, "and the line is left unread for the normal drain")
+        r.tick()
+        self.assertEqual(r.bridge._route.kind, "other", "the normal drain then reads it: fail-closed, the Telegram window is closed")
 
 
 if __name__ == "__main__":
