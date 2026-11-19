@@ -149,6 +149,20 @@ class MarkerToctouTests(RigTestCase):
         # taking the claim worked; moving it back failed: the only copy is kept, never deleted
         self.assertEqual([p.name for p in marker.parent.glob(".turn_end-consume-*")], [".turn_end-consume-%d" % os.getpid()])
 
+    def test_a_link_failure_never_clobbers_an_even_newer_stop(self):
+        r = self.rig
+        self.begin(follow_chat=OWNER)
+        marker = r.bridge._turn_end
+        newest = {}
+
+        def third():
+            r.stop()
+            newest["text"] = marker.read_text("utf-8")
+        with patch("agent2telegram.attach.os.link", side_effect=PermissionError("no hard links")):
+            self.finish_turn_one(third, during_finishing=r.stop)
+        self.assertEqual(marker.read_text("utf-8"), newest["text"])
+        self.assertEqual(sorted(p.name for p in marker.parent.glob(".turn_end-*")), [])
+
 
 if __name__ == "__main__":
     unittest.main()
