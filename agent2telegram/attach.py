@@ -271,6 +271,7 @@ class AttachBridge:
     _n1 = None                  # shared_session.SharedSession, None = off (the default)
     _n1_gate = None             # RLock: route changes of the transcript thread and the inbound thread
     _n1_last_rec = 0.0          # monotonic ts of the last transcript content (last-resort idle fallback)
+    _hold_next_turn = False     # while a turn is being finished, the drain stops before the record that starts the NEXT turn
     _route = None               # shared_session.Route: THE routing state of the running turn (ON only)
 
     def __init__(self, cfg: Config, *, client: TelegramClient | None = None) -> None:
@@ -2304,7 +2305,13 @@ class AttachBridge:
             source = "transcript"
             out = ""
             if self._has_turn_end_backstop_source():
-                last = self._retry_last_assistant_text()
+                # Finishing turn N may read the rest of turn N (its final answer), never the record that starts turn N+1: that
+                # record opens the next route, which this finishing (turn_end / exit / active flags below) would then release.
+                self._hold_next_turn = self._n1 is not None
+                try:
+                    last = self._retry_last_assistant_text()
+                finally:
+                    self._hold_next_turn = False
                 out = self._strip_marker(last) if last else ""
                 if not out and not self._turn_text_sent:
                     source = "signal"
@@ -2687,6 +2694,10 @@ class AttachBridge:
                     rec = None
                     if n1 is None:
                         continue
+                if n1 is not None and self._hold_next_turn and (
+                        not isinstance(rec, dict) or shared.classify(rec) in ("human", "foreign", "notification")):
+                    self._tpos = rec_off          # left for the normal drain: it starts the next turn, not this finishing
+                    break
                 if n1 is not None:
                     if not isinstance(rec, dict):
                         # A complete line that cannot be read stands for a lost record (maybe a switch to
