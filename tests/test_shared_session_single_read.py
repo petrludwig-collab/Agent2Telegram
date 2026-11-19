@@ -224,7 +224,7 @@ class OwnTurnReadEndTests(RigTestCase):
                 weird = {"type": "attachment", "uuid": ["not", "a", "str"], "parentUuid": {}}
                 duration = {"type": "system", "subtype": "turn_duration", "uuid": f"d-{id(bad)}", "parentUuid": bad}
                 tip = {"type": "attachment", "uuid": f"t-{id(bad)}", "parentUuid": None}      # a valid output record: the tip is set
-                calls, waits = self.finish([tip, weird, summary, duration, answer])       # one chunk: the answer follows the malformed records
+                calls, waits = self.finish([weird, tip, summary, duration, answer])       # one chunk: the answer follows the malformed records
                 self.assertEqual(r.sent_to(OWNER), ["the answer"], "delivered fully, exactly once")
                 self.assertEqual(len(waits), attach_mod.BACKSTOP_RETRY_ATTEMPTS - 1, "no evidence: the bounded retry ran")
                 self.assertEqual(r.bridge._route.kind, "none")
