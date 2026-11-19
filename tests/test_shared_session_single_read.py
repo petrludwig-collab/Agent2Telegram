@@ -235,6 +235,19 @@ class OwnTurnReadEndTests(RigTestCase):
         self.assertEqual(len(waits), 3, "read on until the answer's own summary")
         self.assertEqual(self.rig.sent_to(OWNER), ["the full answer"])
 
+    def test_the_evidence_of_a_route_does_not_carry_over_to_the_next_turn_that_replaces_it(self):
+        r = self.rig
+        self.start("one")
+        r.append(assistant("answer one", "a-0"), {"type": "system", "subtype": "stop_hook_summary", "uuid": "s-0", "parentUuid": "a-0"})
+        r.drain()
+        self.assertTrue(r.bridge._own_turn_read)
+        self.start("two")                                               # turn 2 opens its own route (no exit between)
+        self.assertFalse(r.bridge._own_turn_read, "turn 1's summary is not evidence about turn 2")
+        calls, waits = self.finish([assistant("answer two", "a-1"),
+                                    {"type": "system", "subtype": "stop_hook_summary", "uuid": "s-1", "parentUuid": "a-1"}])
+        self.assertEqual(len(waits), 1)
+        self.assertIn("answer two", r.sent_to(OWNER))
+
     def test_a_transcript_reset_clears_the_evidence(self):
         r = self.rig
         self.start()
