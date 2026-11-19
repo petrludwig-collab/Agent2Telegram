@@ -255,7 +255,7 @@ class Sync:
 
 
 def _fresh() -> dict:
-    return {"v": VERSION, "transcript": None, "turn": None, "nonces": {}, "jobs": {}, "sends": {}}
+    return {"v": VERSION, "transcript": None, "turn": None, "nonces": {}, "jobs": {}, "sends": {}, "boundary_uuid": None}
 
 
 def _validate(st) -> None:
@@ -397,6 +397,7 @@ class SharedSession:
                 self._reset_locked("invalid state file")
                 return
             st.setdefault("sends", {})
+            st.setdefault("boundary_uuid", None)
             self._s = st
 
             def recover(new):
@@ -517,6 +518,7 @@ class SharedSession:
             elif job["state"] == "claimed":
                 job["state"], job["at"] = "uncertain", now
         st["turn"] = None
+        st["boundary_uuid"] = None                        # nothing older than a reset may anchor a route
         adopt(st)
 
     # ---- issuing (R8) ------------------------------------------------------
@@ -786,6 +788,7 @@ class SharedSession:
             return
         self._end_route(st, now)
         uuid = rec.get("uuid") if isinstance(rec.get("uuid"), str) else None
+        st["boundary_uuid"] = uuid                        # the record that started the turn Claude is running now
         if consumed:
             nrec = st["nonces"][consumed]
             nrec["state"], nrec["off"] = "consumed", nrec.get("off") if out.again else offset
@@ -822,7 +825,7 @@ class SharedSession:
                 # The route is opened by a queued_command INSIDE a running turn: that turn's own prompt record (the
                 # `other` turn's opening record) is the anchor whose Stop ends it; nothing older may.
                 st["turn"] = {"kind": "tg", "chat": nrec["chat"], "nonce": consumed, "job": None, "uuid": uuid,
-                              "anchor": turn.get("uuid") if turn else None}
+                              "anchor": st.get("boundary_uuid")}
         elif turn["chat"] != nrec["chat"]:
             was_cut = bool(turn.get("cut"))
             turn["cut"] = True
@@ -866,6 +869,7 @@ class SharedSession:
             return
         uuid = rec.get("uuid") if isinstance(rec.get("uuid"), str) else None
         self._end_route(st, now)
+        st["boundary_uuid"] = uuid
         other = {"kind": "other", "chat": None, "nonce": None, "job": None, "uuid": uuid}
         if not self._valid_pending(st, job, now):
             st["turn"] = other                            # terminal / unbound / expired / foreign / already claimed

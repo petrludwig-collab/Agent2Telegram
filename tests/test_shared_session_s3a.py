@@ -66,6 +66,11 @@ class S3aReplayTests(RigTestCase):
         sent = r.sent_to(OWNER)
         self.assertEqual(sent.count(FOLLOW_ANSWER), 1, f"the answer to the follow-up must be delivered once: {sent}")
         self.assertEqual(len([t for t in sent if t.startswith("1 SAMEA")]), 1, "and so must the first answer")
+        # the Stop of the follow-up turn (the hook names the queued human record) ends its route: no idle wait
+        r.bridge._idle_limit = lambda: 10 ** 9
+        self.stop_marker()
+        r.tick()
+        self.assertEqual(r.bridge._route.kind, "none", "the real Stop of the follow-up turn ends the route")
 
     def stop_marker(self):
         self.rig.stop()                       # the real Stop hook entrypoint, reading the transcript as it is NOW
@@ -235,6 +240,77 @@ class QueuedCommandRouteEndsWithItsTurnsStopTests(RigTestCase):
         stop_hook._mark(str(r.bridge._signal), older)
         r.tick()                                                       # the stale marker meets the restored route
         self.assertEqual(r.bridge._route.kind, "tg", "identity survives the restart (no injected-turn boundary exists then)")
+
+
+class AnchorWhenTheStoredTurnWasClearedMidTurnTests(RigTestCase):
+    """The stored turn can be None while Claude is still inside a turn; the anchor is the latest boundary record, not the turn."""
+
+    def run_queued_input(self, clear, prompt="typed over SSH"):
+        r = self.rig
+        r.bridge._idle_limit = lambda: 10 ** 9
+        clear(r, prompt)
+        self.assertIsNone(r.n1.turn(), "the stored turn is None while the turn runs")
+        self.assertTrue(r.tg(OWNER, "from Telegram into the running turn"))
+        r.append({"type": "attachment", "uuid": "qc-none", "attachment": {"type": "queued_command", "prompt": r.typed[-1]}})
+        r.drain()
+        self.assertEqual(r.bridge._route.kind, "tg")
+        r.say("[tg] the common answer")
+        r.stop()                                                       # the Stop of the running turn names its prompt
+        r.tick()
+        r.tick()
+        self.assertEqual(r.bridge._route.kind, "none", "ended by that Stop, without the idle fallback")
+        self.assertEqual(r.sent_to(OWNER), ["the common answer"])
+
+    def test_idle_closed_store_turn_while_the_terminal_turn_runs(self):
+        def clear(r, prompt):
+            r.terminal(prompt)
+            r.n1.close_turn()                                          # e.g. the idle fallback closed the stored turn
+        self.run_queued_input(clear)
+
+    def test_a_dead_result_job_ended_the_stored_turn_while_claude_still_runs_it(self):
+        from n1_rig import notification
+        clock = type("C", (), {"t": 1_000_000.0, "__call__": lambda s: s.t})()
+
+        def clear(r, prompt):
+            r.n1._clock = clock
+            r.tg_turn(OWNER, "A")
+            r.launch("tA")
+            r.end_turn()
+            r.append(notification("tA", "notif-uuid"))                # Claude starts processing the completion
+            r.drain()
+            self.assertEqual(r.n1.turn()["kind"], "notif")
+            clock.t += 86401 * 2                                       # the job is dead (T2): the stored turn ends
+            r.n1.expire()
+        self.run_queued_input(clear)
+
+    def test_an_older_stop_is_still_refused_when_the_stored_turn_was_cleared(self):
+        from agent2telegram import stop_hook
+        from agent2telegram.readers import ClaudeCodeReader, latest_user
+        r = self.rig
+        r.bridge._idle_limit = lambda: 10 ** 9
+        r.terminal("an older terminal prompt")
+        offset, rec = latest_user(r.transcript, ClaudeCodeReader())
+        older = {"transcript_path": str(r.transcript.resolve()), "user_offset": offset, "user_uuid": rec.get("uuid")}
+        r.terminal("the prompt of the running turn")
+        r.n1.close_turn()
+        self.assertTrue(r.tg(OWNER, "from Telegram"))
+        r.append({"type": "attachment", "uuid": "qc-none", "attachment": {"type": "queued_command", "prompt": r.typed[-1]}})
+        r.drain()
+        stop_hook._mark(str(r.bridge._signal), older)
+        r.tick()
+        self.assertEqual(r.bridge._route.kind, "tg", "a Stop naming an older prompt never ends it; there is no any-Stop fallback")
+
+    def test_a_reset_clears_the_boundary_so_nothing_older_can_anchor(self):
+        import os
+        r = self.rig
+        r.terminal("old")
+        self.assertIsNotNone(r.n1.snapshot()["boundary_uuid"])
+        replacement = r.tmp / "new.jsonl"
+        replacement.write_text(json.dumps({"type": "user", "uuid": "z0", "origin": {"kind": "human"},
+                                           "message": {"role": "user", "content": "another session"}}) + "\n")
+        os.replace(replacement, r.transcript)
+        r.drain()
+        self.assertIsNone(r.n1.snapshot()["boundary_uuid"])
 
 
 if __name__ == "__main__":
