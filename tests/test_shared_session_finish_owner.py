@@ -1,12 +1,12 @@
-"""Pilot 3 (Claude Code 2.1.328): finishing answer 1 must not release the route of the follow-up that Claude runs next.
+"""Live trial 3 (Claude Code 2.1.328): finishing answer 1 must not release the route of the follow-up that Claude runs next.
 
-CAPTURED (bridge log of pilot 3, sanitised): the Stop marker of turn 1 names the prompt of turn 1 and is ACCEPTED; inside the finishing
+CAPTURED (bridge log of live trial 3, sanitised): the Stop marker of turn 1 names the prompt of turn 1 and is ACCEPTED; inside the finishing
 the bridge reads the rest of the transcript (answer 1, `dequeue`, `stop_hook_summary`, `turn_duration` and the NEW `user` human
 promptSource=queued record of turn 2, which opens its tg route for the same chat); then the finishing of turn 1 releases ... the NEW route
 (`turn_end` + `_n1_exit`); answer 2 is dropped by the send gate and turn 2's Stop finds route none.
 
-The records are the relevant records of the pilot-2 trace (same shape, fixtures/pilot2_s3a_records.jsonl); the ORDER is the captured one
-of pilot 3: the inner drain of the finishing (the backstop wait of `_finish_turn`) is where the new record arrives. The test drives the
+The records are the relevant records of the live-trial-2 trace (same shape, fixtures/pilot2_s3a_records.jsonl); the ORDER is the captured one
+of live trial 3: the inner drain of the finishing (the backstop wait of `_finish_turn`) is where the new record arrives. The test drives the
 real Stop marker, `_end_turn` -> `_hook_ends_current_turn` -> `_finish_turn` -> backstop retry -> inner `_drain_transcript` -> `_n1_turn_ended`
 and the real send gate; the new record is NOT read in the outer tick before the Stop check.
 """

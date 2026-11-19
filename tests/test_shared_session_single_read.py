@@ -1,8 +1,8 @@
-"""Pilot 4: finishing a turn must deliver the answer THAT TURN wrote, read through the one live read path, never "the last text of the file".
+"""Live trial 4: finishing a turn must deliver the answer THAT TURN wrote, read through the one live read path, never "the last text of the file".
 
 R1: answer 2 already exists when the finishing of turn 1 starts selecting its answer (the outer tick had read only up to turn 1's
     `enqueue`; the rest of the file is appended at the very start of `_finish_turn`, before any read there).
-R2: exactly pilot 4: when turn 1's Stop is evaluated the file ends at `enqueue`; answer 1 and everything after it (turn 2's queued human
+R2: exactly live trial 4: when turn 1's Stop is evaluated the file ends at `enqueue`; answer 1 and everything after it (turn 2's queued human
     record, answer 2, its summary) arrive DURING the finishing, at the first backstop wait.
 Both for a DM and for a group (group_interim off: the final text is buffered until the Stop), with the real Stop hook, the real outer
 loop, the real send gate and the fake Telegram; idle fallback disabled; no real time (the wait is replaced, never slept).

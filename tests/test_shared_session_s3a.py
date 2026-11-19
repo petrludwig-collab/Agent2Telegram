@@ -1,4 +1,4 @@
-"""Pilot 2, scenario S3a (Claude Code 2.1.328): a follow-up message of the SAME chat during a running answer.
+"""Live trial 2, scenario S3a (Claude Code 2.1.328): a follow-up message of the SAME chat during a running answer.
 
 CAPTURED (private raw trace, fixture = the relevant records byte-exact per line except sanitised paths/thinking/hook command):
 the follow-up arrives as `queue-operation enqueue`; the answer of turn 1 is written; `queue-operation dequeue`, `system
@@ -147,7 +147,7 @@ class S3aQueueReceiptAndModesTests(RigTestCase):
     def test_both_modes_deliver_the_follow_up_answer_queued_command_inside_a_turn_and_a_separate_queued_turn(self):
         from n1_rig import human
         r = self.rig
-        # mode 1 (pilot 1, 2.1.326): an attachment queued_command inside the running turn; the old Stop then names the opener
+        # mode 1 (live trial 1, 2.1.326): an attachment queued_command inside the running turn; the old Stop then names the opener
         r.tg_turn(OWNER, "first, with tool calls")
         self.assertTrue(r.tg(OWNER, "follow-up one"))
         r.append({"type": "attachment", "uuid": "qc-1", "attachment": {"type": "queued_command", "prompt": r.typed[-1]}})
@@ -157,7 +157,7 @@ class S3aQueueReceiptAndModesTests(RigTestCase):
         r.tick()
         r.tick()
         self.assertEqual(r.bridge._route.kind, "none")
-        # mode 2 (pilot 2, 2.1.328): a separate human promptSource=queued turn after the Stop of the previous one
+        # mode 2 (live trial 2, 2.1.328): a separate human promptSource=queued turn after the Stop of the previous one
         r.tg_turn(OWNER, "second")
         self.assertTrue(r.tg(OWNER, "follow-up two"))
         queued_prompt = r.typed[-1]

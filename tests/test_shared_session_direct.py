@@ -1,4 +1,4 @@
-"""Direct input, Claude's native ordering, correct background delivery (OPS-A2T-BG-1 step 2).
+"""Direct input, Claude's native ordering, correct background delivery (shared-session mode).
 
 Telegram and tmux/SSH are two entrances to ONE conversation. The bridge forwards every input at once and never waits;
 Claude orders its own queue. A background result is delivered when the harness itself starts processing its completion
@@ -6,7 +6,7 @@ Claude orders its own queue. A background result is delivered when the harness i
 An envelope that Claude took from its queue (an `attachment` of type `queued_command`) is consumed like a human record
 but is NOT the start of a new answer.
 
-Fixtures are reconstructed from the sanitised structure of the pilot evidence (record types and fields); the exact
+Fixtures are reconstructed from the sanitised structure of a live trial (record types and fields); the exact
 nesting of the `queued_command` attachment is inferred and NOT verified against a live Claude Code. Synthetic texts.
 Historic RED (5db88bb): a report prompt recorded as queued_command was never consumed, the route stayed pending, the
 result was dropped and the job became uncertain after T1 (see the A4 characterisation commits 9ef9b2c / 5db88bb).
