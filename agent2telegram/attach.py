@@ -2383,8 +2383,11 @@ class AttachBridge:
                 # A claimed result turn is started by the task-notification record itself: the Stop hook of THAT
                 # turn names this record as its prompt (the Stop of the previous turn names an older one).
                 return rec.get("uuid") == turn.get("uuid")
-            if turn and turn["kind"] == "tg" and rec.get("uuid") == turn.get("uuid"):
-                return True                          # the record that opened this route (also when text was mixed in)
+            if turn and turn["kind"] == "tg" and turn.get("uuid"):
+                # A Telegram route ends only with the Stop of the turn that ITS opening record started. The Stop marker of
+                # an OLDER turn names an older prompt: with a follow-up that Claude runs as its own turn right after the
+                # previous one (promptSource queued), that stale marker must not cancel the new answer.
+                return rec.get("uuid") == turn["uuid"]
         text = self._reader.user_text(rec)
         origins = getattr(self, "_origins", (self.cfg.origin_prefix.strip(), "Telegram:", "[TG]"))
         if not text or not text.lstrip().startswith(tuple(p for p in origins if p)):
