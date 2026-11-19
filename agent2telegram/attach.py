@@ -2194,16 +2194,39 @@ class AttachBridge:
     def _consume_turn_end(self, seen: str | None = None) -> None:
         if self._turn_end is not None:
             if self._n1 is not None:
-                # Shared session: only the marker that was EVALUATED (and belonged to the turn being ended or ignored) goes.
-                # A newer marker (the Stop of a short next turn written while this one was being finished) survives and is
-                # processed for its own turn.
-                try:
-                    if seen is None or self._turn_end.read_text("utf-8") != seen:
-                        return
-                except OSError:
-                    return
+                self._consume_evaluated_marker(seen)
+                return
             try:
                 self._turn_end.unlink()
+            except OSError:
+                pass
+
+    def _consume_evaluated_marker(self, seen: str | None) -> None:
+        """Shared session: remove the marker that was EVALUATED, never a newer one. The marker is first renamed to a private
+        name (atomic: it takes whatever file is at the path at that instant), and the content that is compared is the content
+        of THAT file, so the bytes compared are the bytes removed; a Stop written by the hook at any other moment lands on the
+        path afterwards and is not touched. A newer marker that was taken is given back (no-clobber: if an even newer one is
+        already there, the single-slot marker keeps only the latest)."""
+        if seen is None:
+            return
+        claim = self._turn_end.with_name(f".turn_end-consume-{os.getpid()}")
+        try:
+            os.replace(self._turn_end, claim)
+        except OSError:
+            return
+        try:
+            try:
+                same = claim.read_text("utf-8") == seen
+            except (OSError, ValueError):
+                same = False
+            if not same:
+                try:
+                    os.link(claim, self._turn_end)
+                except OSError:
+                    pass
+        finally:
+            try:
+                claim.unlink()
             except OSError:
                 pass
 
