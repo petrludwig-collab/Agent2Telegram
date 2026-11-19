@@ -146,6 +146,48 @@ class FinishOwnershipTests(RigTestCase):
         self.assertEqual(r.bridge._route.kind, "none")
 
 
+class TerminalStopConsumedOnceTests(RigTestCase):
+    def count_ends(self):
+        r = self.rig
+        calls = {"finish": 0, "turn_end": 0}
+        real_finish, real_turn_end = r.bridge._finish_turn, r.n1.turn_end
+
+        def finish(*a, **k):
+            calls["finish"] += 1
+            return real_finish(*a, **k)
+
+        def turn_end(*a, **k):
+            calls["turn_end"] += 1
+            return real_turn_end(*a, **k)
+        r.bridge._finish_turn = finish
+        r.n1.turn_end = turn_end
+        return calls
+
+    def test_the_stop_of_a_terminal_only_turn_is_consumed_by_one_evaluation(self):
+        r = self.rig
+        r.terminal("look at the logs")
+        r.say("done, nothing for Telegram")
+        calls = self.count_ends()
+        r.stop()
+        for _ in range(4):
+            r.tick()
+        self.assertFalse(r.bridge._turn_end.exists(), "the marker this end acted on is consumed")
+        self.assertEqual(calls["finish"], 1, "the end ran once, not on every tick")
+        self.assertLessEqual(calls["turn_end"], 1)
+
+    def test_the_stop_marker_without_an_active_turn_after_a_restart_is_consumed_once(self):
+        r = self.rig
+        r.tg_turn(OWNER, "question")
+        r.bridge._turn_active.clear()                                  # a restart lost the turn state
+        r.bridge._turn_input_boundary = None
+        calls = self.count_ends()
+        r.stop()
+        for _ in range(4):
+            r.tick()
+        self.assertFalse(r.bridge._turn_end.exists())
+        self.assertEqual(calls["finish"], 1)
+
+
 class GroupBufferOwnershipTests(RigTestCase):
     def new_turn(self, chat, text):
         from n1_rig import human

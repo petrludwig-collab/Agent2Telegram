@@ -1916,7 +1916,7 @@ class AttachBridge:
         self._turn_tpos = getattr(self, "_n1_rec_off", self._turn_tpos)   # the new turn's backstop must not read the old turn's text
         reply, self._group_reply = self._group_reply, None
         files, self._group_files = tuple(self._group_files or ()), ()
-        if self._turn_from_tg and (reply is not None or files):
+        if reply is not None or files:
             if files:
                 self._pending_files = list(getattr(self, "_pending_files", []) or []) + list(files)
             # the route is still the old one here: the single send gate re-checks authorisation and the cut for ITS chat
@@ -2395,14 +2395,18 @@ class AttachBridge:
     def _end_turn(self, *, confirmed: bool = True, from_hook: bool = False) -> None:
         # Claude Stop-hook path: catch anything written just before the hook fired, then finish.
         boundary = getattr(self, "_turn_input_boundary", None)
-        self._marker_seen = None
         self._drain_transcript()
         has_marker = self._turn_end is not None and self._turn_end.exists()
+        try:                                     # bind the marker this end acts on BEFORE any early return in the evaluation
+            self._marker_seen = self._turn_end.read_text("utf-8") if has_marker else None
+        except OSError:
+            self._marker_seen = None
         if (boundary is not getattr(self, "_turn_input_boundary", None)
                 or (from_hook and not has_marker)
                 or (has_marker and not self._hook_ends_current_turn())):
             log.info("turn end ignored: it does not belong to the current Telegram input")
-            self._consume_turn_end(self._marker_seen)
+            seen, self._marker_seen = self._marker_seen, None
+            self._consume_turn_end(seen)
             return
         if confirmed:
             self._finish_turn()
@@ -2447,7 +2451,6 @@ class AttachBridge:
             return True
         try:
             content = self._turn_end.read_text("utf-8")
-            self._marker_seen = content
             try:
                 marker = json.loads(content)
             except ValueError:
