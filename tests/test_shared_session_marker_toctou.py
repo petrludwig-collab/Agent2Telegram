@@ -137,16 +137,16 @@ class MarkerToctouTests(RigTestCase):
         self.begin(follow_chat=OWNER)
         marker = r.bridge._turn_end
 
-        real_replace = os.replace
+        real_open = os.open
 
-        def failing_replace(src, dst):
-            if str(src).endswith(".turn_end-consume-%d" % os.getpid()):
-                raise PermissionError("cannot move back")
-            return real_replace(src, dst)
+        def failing_open(path, flags, *a, **k):
+            if str(path) == str(marker) and flags & os.O_EXCL:
+                raise PermissionError("cannot create")
+            return real_open(path, flags, *a, **k)
         with patch("agent2telegram.attach.os.link", side_effect=PermissionError("no hard links")), \
-                patch("agent2telegram.attach.os.replace", side_effect=failing_replace):
+                patch("agent2telegram.attach.os.open", failing_open):
             self.finish_turn_one(lambda: None, during_finishing=r.stop)
-        # taking the claim worked; moving it back failed: the only copy is kept, never deleted
+        # taking the claim worked; placing it back failed: the only copy is kept, never deleted
         self.assertEqual([p.name for p in marker.parent.glob(".turn_end-consume-*")], [".turn_end-consume-%d" % os.getpid()])
 
     def test_a_link_failure_never_clobbers_an_even_newer_stop(self):
@@ -161,6 +161,37 @@ class MarkerToctouTests(RigTestCase):
         with patch("agent2telegram.attach.os.link", side_effect=PermissionError("no hard links")):
             self.finish_turn_one(third, during_finishing=r.stop)
         self.assertEqual(marker.read_text("utf-8"), newest["text"])
+        self.assertEqual(sorted(p.name for p in marker.parent.glob(".turn_end-*")), [])
+
+    def test_the_hook_publishing_an_even_newer_stop_in_the_fallback_window_is_never_overwritten(self):
+        r = self.rig
+        self.begin(follow_chat=OWNER)
+        marker = r.bridge._turn_end
+        newest = {}
+        real_exists, real_open = Path.exists, os.open
+
+        def publish_once():
+            if not newest:
+                r.stop()                                                # C, written by the real hook (temp file + replace)
+                newest["text"] = real_read_text(marker)
+
+        real_read_text = Path.read_text
+
+        def exists(path):
+            result = real_exists(path)
+            if path == marker and not result:
+                publish_once()                                          # window: after the free-check, before the placing
+            return result
+
+        def open_(path, flags, *a, **k):
+            if str(path) == str(marker) and flags & os.O_EXCL:
+                publish_once()                                          # window: before the exclusive create
+            return real_open(path, flags, *a, **k)
+        with patch("agent2telegram.attach.os.link", side_effect=PermissionError("no hard links")), \
+                patch.object(Path, "exists", exists), patch("agent2telegram.attach.os.open", open_):
+            self.finish_turn_one(lambda: None, during_finishing=r.stop)  # B is already there when turn 1's Stop is consumed
+        self.assertTrue(newest, "the fallback window was reached")
+        self.assertEqual(real_read_text(marker), newest["text"], "C survived, nothing older overwrote it")
         self.assertEqual(sorted(p.name for p in marker.parent.glob(".turn_end-*")), [])
 
 

@@ -2224,17 +2224,22 @@ class AttachBridge:
             except FileExistsError:
                 pass                                    # an even newer Stop is already there: it is the one that stays
             except OSError as exc:
-                # No hard links here (or another failure): the newer Stop must not be destroyed. Move it back if the path is
-                # still free; if that fails too, keep the claim file rather than delete the only copy.
+                # No hard links here (or another failure): the newer Stop must not be destroyed. Place its bytes with an atomic
+                # no-clobber create (O_EXCL): if the hook published an even newer Stop meanwhile the create fails and ours is dropped;
+                # if it publishes while we are still writing, its file wins. If the create fails for another reason, keep the claim
+                # file (never read as a marker) rather than delete the only copy.
                 log.warning("shared session: could not give the newer Stop marker back with a link (%s)", exc)
                 try:
-                    if not self._turn_end.exists():
-                        os.replace(claim, self._turn_end)
-                        return
-                except OSError:
+                    data = claim.read_bytes()
+                    fd = os.open(self._turn_end, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    try:
+                        os.write(fd, data)
+                    finally:
+                        os.close(fd)
+                except FileExistsError:
                     pass
-                if not self._turn_end.exists():
-                    return                              # kept as .turn_end-consume-<pid>, never read as a marker
+                except OSError:
+                    return                              # kept as .turn_end-consume-<pid>
         try:
             claim.unlink()
         except OSError:
